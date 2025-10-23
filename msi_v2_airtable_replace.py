@@ -69,6 +69,8 @@ RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b
 
 SECTION_HEADERS = ("beschreibung", "objektbeschreibung", "ausstattung", "lage", "sonstiges", "weitere informationen")
 
+STOP_STRINGS = ("Ihre Anfrage", "Kontakt", "Exposé anfordern", "Neueste Immobilien")
+
 def detect_category(page_text: str) -> str:
     if RE_MIETE.search(page_text):
         return "Mieten"
@@ -91,15 +93,45 @@ def clean_price_string(s: str) -> str:
         eur = RE_EUR_ANY.search(s)
         return eur.group(0) if eur else ""
 
-def extract_price(soup: BeautifulSoup, page_text: str) -> str:
-    # 1) Zeilenweise Label→Wert (Kaufpreis: 325.000 €)
-    for txt in page_text.splitlines():
-        txt = txt.strip()
-        m = RE_PRICE_LINE.search(txt)
-        if m:
-            return clean_price_string(m.group(2) + " €")
+def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
+    """
+    Liest Preis aus JSON-LD (schema.org Offer -> price / priceCurrency), falls vorhanden.
+    """
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.get_text(strip=True))
+        except Exception:
+            continue
+        # JSON-LD kann Objekt oder Liste sein
+        candidates = data if isinstance(data, list) else [data]
+        for node in candidates:
+            # Direkt Offer
+            if isinstance(node, dict):
+                offer = None
+                if node.get("@type") in ("Offer", "AggregateOffer"):
+                    offer = node
+                elif "offers" in node:
+                    offer = node["offers"]
+                if isinstance(offer, dict):
+                    price = offer.get("price") or offer.get("lowPrice")
+                    if price:
+                        try:
+                            val = float(str(price).replace(".", "").replace(",", "."))
+                            return f"{val:,.0f} €".replace(",", ".")
+                        except:
+                            pass
+                # Fallback: irgendwo price-Feld
+                for k in ("price", "lowPrice", "highPrice"):
+                    if k in node and node[k]:
+                        try:
+                            val = float(str(node[k]).replace(".", "").replace(",", "."))
+                            return f"{val:,.0f} €".replace(",", ".")
+                        except:
+                            continue
+    return ""
 
-    # 2) DOM: dt/dd
+def extract_price_dom(soup: BeautifulSoup) -> str:
+    # dt/dd
     for dt in soup.select("dt"):
         label = (dt.get_text(" ", strip=True) or "").lower()
         if any(k in label for k in ("kaufpreis", "kaltmiete", "warmmiete", "nettokaltmiete", "miete", "preis")):
@@ -107,8 +139,7 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
             if dd:
                 got = clean_price_string(dd.get_text(" ", strip=True))
                 if got: return got
-
-    # 3) DOM: table tr th/td
+    # table tr th/td
     for tr in soup.select("table tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
         if len(cells) >= 2:
@@ -116,15 +147,59 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
             if any(k in label for k in ("kaufpreis", "kaltmiete", "warmmiete", "nettokaltmiete", "miete", "preis")):
                 got = clean_price_string(cells[1])
                 if got: return got
-
-    # 4) DOM: Listen
+    # label: value in Listen
     for li in soup.select("li"):
         txt = li.get_text(" ", strip=True)
         m = RE_PRICE_LINE.search(txt)
         if m:
             return clean_price_string(m.group(2) + " €")
+    return ""
 
-    # 5) Fallback: größte Euro-Zahl im Dokument
+def extract_price_strict_top(page_text: str) -> str:
+    """
+    Fallback: Suche NUR im oberen Seitenabschnitt (bis erste STOP_STRINGS),
+    und nimm die erste vernünftige €-Zahl (≥ 10.000).
+    """
+    top = page_text
+    for stop in STOP_STRINGS:
+        pos = top.lower().find(stop.lower())
+        if pos != -1:
+            top = top[:pos]
+            break
+    euros = [e.group(0) for e in RE_EUR_ANY.finditer(top)]
+    euros_filtered = []
+    for e in euros:
+        num = RE_EUR_NUMBER.search(e)
+        if not num:
+            continue
+        try:
+            val = float(num.group(0).replace(".", "").replace(",", "."))
+            if val >= 10000:  # realistische Untergrenze
+                euros_filtered.append(e)
+        except:
+            continue
+    if euros_filtered:
+        # Erste vernünftige Zahl im Kopfbereich
+        return clean_price_string(euros_filtered[0])
+    return ""
+
+def extract_price(soup: BeautifulSoup, page_text: str) -> str:
+    # 0) JSON-LD (präzise)
+    p = extract_price_from_jsonld(soup)
+    if p: return p
+    # 1) Zeilenweise Label→Wert
+    for txt in page_text.splitlines():
+        txt = txt.strip()
+        m = RE_PRICE_LINE.search(txt)
+        if m:
+            return clean_price_string(m.group(2) + " €")
+    # 2) DOM
+    p = extract_price_dom(soup)
+    if p: return p
+    # 3) Kopfbereich–Fallback
+    p = extract_price_strict_top(page_text)
+    if p: return p
+    # 4) letzter Fallback: größte Euro-Zahl im ganzen Dokument
     euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
     if euros:
         def to_float(e):
@@ -133,14 +208,12 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
             except: return 0.0
         best = max(euros, key=to_float)
         return clean_price_string(best)
-
     return ""
 
 def extract_description(soup: BeautifulSoup) -> str:
     """
     Bevorzugt den Abschnitt unter einer H2/H3-Überschrift mit 'Beschreibung' o.ä.
-    Fallback: typische Content-Container; danach erste P-Blöcke nach dem H1.
-    Filtert Anfrage-/Formular-/Sidebar-Texte heraus.
+    Fallbacks: typische Content-Container, Meta/OG, Feature-Liste, dann erste <p> nach H1.
     """
     # 1) Abschnitt anhand Überschrift
     for h in soup.select("h2, h3"):
@@ -152,7 +225,7 @@ def extract_description(soup: BeautifulSoup) -> str:
                     break
                 if sib.name == "p":
                     t = sib.get_text(" ", strip=True)
-                    if t and not any(stop in t for stop in ("Ihre Anfrage", "Kontakt", "Exposé anfordern")):
+                    if t and not any(stop in t for stop in STOP_STRINGS):
                         chunks.append(t)
                 if sib.has_attr("class"):
                     cls = " ".join(sib.get("class"))
@@ -163,22 +236,47 @@ def extract_description(soup: BeautifulSoup) -> str:
             if chunks:
                 return "\n\n".join(chunks).strip()
 
-    # 2) Fallback – typische Content-Container
-    candidates = soup.select(".entry-content, article, .content, .post-content, .single-content")
+    # 2) Content-Container
+    candidates = soup.select(".entry-content, article, .content, .post-content, .single-content, [class*='content'], [class*='text']")
     for c in candidates:
         ps = [p.get_text(" ", strip=True) for p in c.select("p")]
-        ps = [p for p in ps if p and not any(stop in p for stop in ("Ihre Anfrage", "Kontakt", "Exposé anfordern"))]
+        ps = [p for p in ps if p and not any(stop in p for stop in STOP_STRINGS)]
         if ps:
             return "\n\n".join(ps[:12]).strip()
 
-    # 3) Fallback – erste 8 <p> nach H1
+    # 3) OG/META-Description
+    ogd = soup.select_one('meta[property="og:description"]')
+    if ogd and ogd.get("content"):
+        c = ogd["content"].strip()
+        if c:
+            return c
+    md = soup.select_one('meta[name="description"]')
+    if md and md.get("content"):
+        c = md["content"].strip()
+        if c:
+            return c
+
+    # 4) Feature-Fallback (Zimmer/Schlafzimmer/Bäder etc.)
+    features = []
+    for li in soup.select("li"):
+        t = li.get_text(" ", strip=True)
+        if not t:
+            continue
+        if re.search(r"\b(zimmer|schlafzimmer|badezimmer|wohnfl|grundstück|nutzfl|balkon|terrasse|garage|stellplatz)\b", t, re.I):
+            if not any(stop in t for stop in STOP_STRINGS):
+                features.append(t)
+    features = list(dict.fromkeys(features))
+    if features:
+        return " • ".join(features[:12])
+
+    # 5) erste <p> nach H1
     h1 = soup.select_one("h1")
     if h1:
         ps = []
         for sib in h1.find_all_next():
             if sib.name == "p":
                 t = sib.get_text(" ", strip=True)
-                if t and not any(stop in t for stop in ("Ihre Anfrage", "Kontakt", "Exposé anfordern")):
+                if t and not any(stop in t for stop in STOP_STRINGS):
                     ps.append(t)
                 if len(ps) >= 8:
                     break
@@ -502,21 +600,25 @@ def run(mode: str):
         seen.update(new_links)
         print(f"[Seite {idx}] {len(new_links)} neue Detailseiten")
 
-   for j, url in enumerate(new_links, 1):
-    try:
-        row = parse_detail(url, mode)
+        for j, url in enumerate(new_links, 1):
+            try:
+                row = parse_detail(url, mode)
 
-        # --- NEU: Skip, wenn im Titel "verkauft" steht ---
-        if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
-            print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
-            continue
-        # -------------------------------------------------
+                # --- NEU: Skip, wenn im Titel "verkauft" steht ---
+                if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
+                    print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
+                    continue
+                # -------------------------------------------------
 
-        unterkat = decide_subcategory(row)
-        record = make_record(row, unterkat)
-        all_rows.append(record)
-        print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
-        time.sleep(0.15)
+                unterkat = decide_subcategory(row)
+                record = make_record(row, unterkat)
+                all_rows.append(record)
+                print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
+                time.sleep(0.15)
+            except Exception as e:
+                print(f"    [FEHLER] {url} -> {e}")
+                continue
+        time.sleep(0.25)
 
     if not all_rows:
         print("[WARN] Keine Datensätze gefunden.")
