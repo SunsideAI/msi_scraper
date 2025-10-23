@@ -62,7 +62,13 @@ RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Z
 RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
 RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
-STOP_STRINGS = ("Ihre Anfrage", "Kontakt", "Exposé anfordern", "Neueste Immobilien", "Teilen auf")
+# Stoppwörter: "Kontakt" ENTFERNT (war zu aggressiv!)
+STOP_STRINGS = (
+    "Ihre Anfrage",
+    "Exposé anfordern",
+    "Neueste Immobilien",
+    "Teilen auf",
+)
 
 TAB_LABELS = {
     "Beschreibung":   ("beschreibung",),
@@ -370,13 +376,11 @@ def extract_description(soup: BeautifulSoup) -> str:
                     # Stop bei nächster Abschnittsüberschrift
                     if sib.name == "p" and "h4" in (sib.get("class") or []):
                         break
-                    # Stop bei Social/Share
+                    # Stop bei typischen Boxen hinter dem Abschnitt
                     txt = sib.get_text(" ", strip=True) if hasattr(sib, "get_text") else ""
                     if any(stop.lower() in (txt or "").lower() for stop in STOP_STRINGS):
                         break
-                    # Inhalte dieses Blocks ernten
                     _harvest_block(sib, lines)
-                    # flache Kinder (Wrapper) mitnehmen
                     for child in sib.find_all(recursive=False):
                         _harvest_block(child, lines)
                     if len(lines) >= 200:
