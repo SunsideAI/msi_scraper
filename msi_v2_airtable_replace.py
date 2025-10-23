@@ -8,7 +8,7 @@ import json
 import requests
 import re
 from urllib.parse import quote, urljoin
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Tag
 
 # ===========================================================================
 # KONFIGURATION / ENV
@@ -32,7 +32,7 @@ AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()     # optional
 #   export MSI_RENDER_TIMEOUT=20000      -> Millisekunden
 MSI_RENDER         = os.getenv("MSI_RENDER", "0").strip() == "1"
 MSI_RENDER_ENGINE  = os.getenv("MSI_RENDER_ENGINE", "playwright").strip().lower()
-MSI_RENDER_TIMEOUT = int(os.getenv("MSI_RENDER_TIMEOUT", "15000"))
+MSI_RENDER_TIMEOUT = int(os.getenv("MSI_RENDER_TIMEOUT", "20000"))
 
 # ===========================================================================
 # REGEX & KONSTANTEN
@@ -67,35 +67,15 @@ TAB_LABELS = {
 }
 
 # ===========================================================================
-# HTTP / HTML – mit optionalem Headless-Rendering
+# HTTP / HTML – immer rendern, wenn MSI_RENDER=1
 # ===========================================================================
 def _simple_fetch(url: str) -> BeautifulSoup:
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
 
-def _seems_unrendered(soup: BeautifulSoup) -> bool:
-    """Heuristik: Exposé da, aber Panel-Content leer -> ungerendert (JS)."""
-    scope = soup.select_one(".sw-yframe .sw-vframe .v-expose") or soup.select_one(".v-expose")
-    if not scope:
-        return False
-    panels = [
-        scope.select_one(".v-tabs-items .v-window__container #tab-0"),
-        scope.select_one(".v-tabs-items .v-window__container .v-window-item.v-window-item--active"),
-    ]
-    for p in panels:
-        if not p:
-            continue
-        txt = p.get_text(" ", strip=True)
-        if txt and len(txt) > 50:
-            return False
-    scope_txt = (scope.get_text(" ", strip=True) or "").lower()
-    if "beschreibung" in scope_txt:
-        return True
-    return True
-
 def _render_with_playwright(url: str, timeout_ms: int) -> str:
-    """Headless-Rendering via Playwright (empfohlen)."""
+    """Headless-Rendering via Playwright."""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -103,28 +83,53 @@ def _render_with_playwright(url: str, timeout_ms: int) -> str:
         page = context.new_page()
         page.set_default_timeout(timeout_ms)
         page.goto(url, wait_until="domcontentloaded")
-        for sel in [".sw-yframe .sw-vframe .v-expose .v-tabs-items", ".v-expose .v-tabs-items", ".v-expose"]:
+
+        # Warte bis Exposé/Tabs im DOM sind
+        for sel in [".sw-yframe .sw-vframe .v-expose .v-tabs-items",
+                    ".v-expose .v-tabs-items",
+                    ".v-expose"]:
             try:
                 page.wait_for_selector(sel, state="attached", timeout=timeout_ms//2)
                 break
             except Exception:
                 continue
-        # sicherheitshalber 'Beschreibung' aktivieren
+
+        # Sicherheit: „Beschreibung“-Tab fokussieren (falls vorhanden)
         try:
-            for t in page.query_selector_all(".v-tab"):
-                if "Beschreibung" in (t.inner_text() or ""):
+            tabs = page.query_selector_all(".v-tab")
+            for t in tabs:
+                label = (t.inner_text() or "").strip()
+                if "Beschreibung" in label:
                     t.click()
-                    time.sleep(0.2)
                     break
         except Exception:
             pass
+
+        # Warten bis Panel-Inhalt wirklich steht (p unter .v-card__text)
+        try:
+            page.wait_for_selector(
+                ".v-expose .v-tabs-items .v-window__container #tab-0 .v-card__text p:not(.h4), "
+                ".v-expose .v-tabs-items .v-window__container .v-window-item.v-window-item--active .v-card__text p:not(.h4)",
+                state="visible",
+                timeout=timeout_ms//2
+            )
+        except Exception:
+            # letzte Chance
+            time.sleep(0.8)
+
+        # network idle hilft oft bei Vuetify
+        try:
+            page.wait_for_load_state("networkidle", timeout=timeout_ms//2)
+        except Exception:
+            pass
+
         html = page.content()
         context.close()
         browser.close()
         return html
 
 def _render_with_requests_html(url: str, timeout_ms: int) -> str:
-    """Fallback-Renderer (einfacher)."""
+    """Fallback-Renderer."""
     from requests_html import HTMLSession
     s = HTMLSession()
     r = s.get(url, headers=HEADERS, timeout=30)
@@ -132,22 +137,30 @@ def _render_with_requests_html(url: str, timeout_ms: int) -> str:
     return r.html.html
 
 def soup_get(url: str) -> BeautifulSoup:
-    """1) normaler Fetch, 2) optional gerendert, wenn Panels leer erscheinen."""
-    soup = _simple_fetch(url)
+    """
+    Wenn MSI_RENDER=1 → *immer* rendern (Playwright/requests_html).
+    Sonst normal mit requests.
+    """
     if not MSI_RENDER:
-        return soup
-    if not _seems_unrendered(soup):
-        return soup
+        return _simple_fetch(url)
+
     try:
         if MSI_RENDER_ENGINE == "requests_html":
             html = _render_with_requests_html(url, MSI_RENDER_TIMEOUT)
         else:
             html = _render_with_playwright(url, MSI_RENDER_TIMEOUT)
         if html:
-            return BeautifulSoup(html, "lxml")
+            soup = BeautifulSoup(html, "lxml")
+            # Debug-Ausgabe: einmalig grob prüfen, ob wir mehr Inhalt haben
+            dbg_len = len(soup.get_text(" ", strip=True))
+            print(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | textlen={dbg_len}")
+            return soup
     except Exception as e:
         print(f"[RENDER] Fehler ({MSI_RENDER_ENGINE}): {e}")
-    return soup
+
+    # Fallback ohne Render
+    print("[RENDER] Fallback: simple fetch")
+    return _simple_fetch(url)
 
 def get_list_page_urls(mode: str, max_pages: int = 50):
     """MSI listet Kauf & Miete gemeinsam unter /kaufen/immobilienangebote/, paginiert mit /page/{n}/"""
@@ -181,7 +194,8 @@ def detect_category(page_text: str) -> str:
 def _normalize_numstring(s: str) -> str:
     if not s: return ""
     s = s.strip()
-    for ch in THIN_SPACES: s = s.replace(ch, "")
+    for ch in THIN_SPACES:
+        s = s.replace(ch, "")
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s:
@@ -198,8 +212,10 @@ def clean_price_string(raw: str) -> str:
     m = RE_EUR_NUMBER.search(raw)
     if not m: return ""
     num = _normalize_numstring(m.group(0))
-    try: val = float(num)
-    except Exception: return ""
+    try:
+        val = float(num)
+    except Exception:
+        return ""
     return f"{val:,.0f} €".replace(",", ".")
 
 def parse_price_to_number(label: str):
@@ -207,18 +223,22 @@ def parse_price_to_number(label: str):
     m = RE_EUR_NUMBER.search(label)
     if not m: return None
     num = _normalize_numstring(m.group(0))
-    try: return float(num)
-    except Exception: return None
+    try:
+        return float(num)
+    except Exception:
+        return None
 
 def _panel_from_tablink(a_tag):
     href = (a_tag.get("href") or "").strip()
     if href.startswith("#"):
         panel = a_tag.find_parent().find_parent().find_next(id=href[1:])
-        if panel: return panel
+        if panel:
+            return panel
     target = a_tag.get("aria-controls")
     if target:
         panel = a_tag.find_parent().find_parent().find_next(id=target)
-        if panel: return panel
+        if panel:
+            return panel
     return None
 
 def _find_tab_navs(soup):
@@ -226,9 +246,11 @@ def _find_tab_navs(soup):
     for nav in soup.select(".kt-tabs-title-list, .nav-tabs, .elementor-tabs-wrapper, ul"):
         for a in nav.select('a[href^="#"], a[aria-controls]'):
             label = _norm(a.get_text(" ", strip=True))
-            if not label: continue
+            if not label:
+                continue
             panel = _panel_from_tablink(a)
-            if panel: pairs.append((label, panel))
+            if panel:
+                pairs.append((label, panel))
     return pairs
 
 def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
@@ -267,6 +289,7 @@ def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
     return ""
 
 def extract_price_near_objnr(soup: BeautifulSoup) -> str:
+    """Sucht Preis im Kopfbereich in der Nähe von 'Objekt-Nr.' (typisch MSI)."""
     obj_nodes = soup.find_all(string=re.compile(r"Objekt[-\s]?Nr", re.I))
     for txtnode in obj_nodes:
         container = txtnode
@@ -404,12 +427,12 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
 RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-def _clean_lines(lines):
+def _clean_desc_lines(lines):
     out, seen = [], set()
     for t in lines:
+        t = _norm(t)
         if not t:
             continue
-        t = _norm(t)
         if any(s.lower() in t.lower() for s in STOP_STRINGS):
             continue
         if RE_PHONE.search(t) or RE_EMAIL.search(t):
@@ -427,50 +450,53 @@ def _find_expose_scope(soup: BeautifulSoup) -> Tag:
 
 def extract_description(soup: BeautifulSoup) -> str:
     """
-    Greift ausschließlich auf den 'Beschreibung'-Tab zu:
-      scope (.v-expose/.sw-vframe) -> .v-tabs-items .v-window__container:
-        1) Panel #tab-0 (üblich 'Beschreibung')
-        2) aktives Panel .v-window-item--active
-      In jedem Panel: .v-card .v-card__text mit <p class="h4">Beschreibung</p> + folgende <p>-Absätze.
+    Nur den Inhalt des Tabs 'Beschreibung' liefern.
+    Suchstrategie:
+      - scope: .sw-yframe .sw-vframe .v-expose → .v-expose → soup
+      - Panel: #tab-0 → aktives .v-window-item.v-window-item--active
+      - Container: .v-card__text; sammle alle p:not(.h4) + li
     """
-    scope = _find_expose_scope(soup)
+    root = _find_expose_scope(soup)
 
-    # 1) Panel #tab-0
-    panel = scope.select_one(".v-tabs-items .v-window__container #tab-0")
-    if not panel:
-        # 2) aktives Panel
-        panel = scope.select_one(".v-tabs-items .v-window__container .v-window-item.v-window-item--active")
-    if not panel:
-        return ""
+    # 1) bevorzugt #tab-0
+    candidates = []
+    tab0 = root.select_one(".v-tabs-items .v-window__container #tab-0")
+    if tab0:
+        candidates.append(tab0)
+    active = root.select_one(".v-tabs-items .v-window__container .v-window-item.v-window-item--active")
+    if active and active not in candidates:
+        candidates.append(active)
 
-    box = panel.select_one(".v-card .v-card__text") or panel.select_one(".v-card__text")
-    if not box:
-        return ""
+    # 2) Fallback: jeder .v-card__text mit Head 'Beschreibung'
+    if not candidates:
+        for box in root.select(".v-card__text"):
+            head = box.select_one("p.h4, h4")
+            if head and _norm(head.get_text(" ", strip=True)).lower() == "beschreibung":
+                candidates.append(box)
 
-    head = box.select_one("p.h4, h4")
-    if head:
-        heading = _norm(head.get_text(" ", strip=True)).lower()
-        # Wenn Head nicht 'Beschreibung' ist, brechen wir nicht hart ab – #tab-0 enthält i.d.R. die Beschreibung
+    for node in candidates:
+        box = node.select_one(".v-card .v-card__text") or node.select_one(".v-card__text") or node
+        lines = []
+        # Überschrift raus
+        head = box.select_one("p.h4, h4")
+        # Absätze
+        for p in box.select("p"):
+            if p is head or ("h4" in (p.get("class") or [])):
+                continue
+            txt = _norm(p.get_text(" ", strip=True))
+            if txt:
+                lines.append(txt)
+        # Listen
+        for li in box.select("ul li, ol li"):
+            t = _norm(li.get_text(" ", strip=True))
+            if t:
+                lines.append("• " + t)
 
-    # Sammle alle <p> außer der Überschrift selbst
-    lines = []
-    for p in box.select("p"):
-        if p is head or ("h4" in (p.get("class") or [])):
-            continue
-        txt = _norm(p.get_text(" ", strip=True))
-        if txt:
-            lines.append(txt)
+        lines = _clean_desc_lines(lines)
+        if lines:
+            return ("\n".join(lines))[:6000]
 
-    if not lines:
-        # Fallback: gesamter Box-Text ohne Head
-        txt = _norm(box.get_text(" ", strip=True))
-        if head:
-            txt = txt.replace(_norm(head.get_text(" ", strip=True)), "").strip()
-        if txt:
-            lines.append(txt)
-
-    lines = _clean_lines(lines)
-    return ("\n".join(lines))[:6000]
+    return ""
 
 # ===========================================================================
 # DETAIL-PARSER
