@@ -15,12 +15,12 @@ USE_GPT_CLASSIFY = True
 
 # Airtable
 AIRTABLE_TOKEN    = os.getenv("AIRTABLE_TOKEN", "").strip()
-AIRTABLE_BASE     = os.getenv("AIRTABLE_BASE",  "").strip()      # app...
-AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()      # optional (Name)
-AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip()   # bevorzugt (tbl...)
-AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()       # optional
+AIRTABLE_BASE     = os.getenv("AIRTABLE_BASE",  "").strip()
+AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()   # optional (Name)
+AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip()# bevorzugt (tbl...)
+AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()    # optional
 
-# OpenAI (nur optional für Kauf-Unterkategorie)
+# OpenAI (optional)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
@@ -33,30 +33,24 @@ def soup_get(url: str) -> BeautifulSoup:
 
 def get_list_page_urls(mode: str, max_pages: int = 50):
     """
-    MSI listet Kauf & Miete zusammen auf /kaufen/immobilienangebote/ und paginiert mit /page/{n}.
-    Wir verwenden für ALLE Modi diese Listing-Seite.
+    MSI listet Kauf & Miete gemeinsam unter /kaufen/immobilienangebote/, paginiert mit /page/{n}/
+    -> Für alle Modi dieselbe Listing-Quelle.
     """
     first = f"{BASE}/kaufen/immobilienangebote/"
     pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
     return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
 
 def collect_detail_links(list_url: str):
-    """
-    Sammelt alle Detail-URLs unter /angebote/...; dedupliziert.
-    """
     soup = soup_get(list_url)
     links = set()
     for a in soup.select('a[href*="/angebote/"]'):
         href = a.get("href")
-        if not href:
-            continue
-        if not href.startswith("http"):
-            href = urljoin(BASE, href)
-        links.add(href)
+        if href:
+            links.add(href if href.startswith("http") else urljoin(BASE, href))
     return list(links)
 
 # ---------------------------------------------------------------------------
-# Detail-Parser – robuste Extraktion für Preis / Beschreibung / Ort
+# Regex / Konstanten
 # ---------------------------------------------------------------------------
 RE_EUR_ANY        = re.compile(r"\b\d{1,3}(?:\.\d{3})*(?:,\d{2})?\s*€")
 RE_EUR_NUMBER     = re.compile(r"\b\d{1,3}(?:\.\d{3})*(?:,\d{2})?\b")
@@ -67,87 +61,149 @@ RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Z
 RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
 RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
-SECTION_HEADERS = ("beschreibung", "objektbeschreibung", "ausstattung", "lage", "sonstiges", "weitere informationen")
-
 STOP_STRINGS = ("Ihre Anfrage", "Kontakt", "Exposé anfordern", "Neueste Immobilien")
 
+SECTION_HEADERS = ("beschreibung", "objektbeschreibung", "ausstattung", "lage", "sonstiges", "weitere informationen")
+
+# Für Tab-Auswertung:
+TAB_LABELS = {
+    "Beschreibung":   ("Beschreibung",),
+    "Objektangaben":  ("Objektangaben","Objektdaten","Daten"),
+    "Ausstattung":    ("Ausstattung","Merkmale"),
+    "Lage":           ("Lage","Lagebeschreibung","Umfeld"),
+    "Energieausweis": ("Energieausweis","Energie","Energiekennwerte"),
+}
+
+# ---------------------------------------------------------------------------
+# Kategorie-Erkennung (Kaufen/Mieten)
+# ---------------------------------------------------------------------------
 def detect_category(page_text: str) -> str:
-    if RE_MIETE.search(page_text):
-        return "Mieten"
-    if RE_KAUF.search(page_text):
-        return "Kaufen"
-    # Heuristik: ohne Mietbegriffe → eher Kauf
+    if RE_MIETE.search(page_text): return "Mieten"
+    if RE_KAUF.search(page_text):  return "Kaufen"
     return "Kaufen"
 
+# ---------------------------------------------------------------------------
+# Preis-Extraktion
+# ---------------------------------------------------------------------------
 def clean_price_string(s: str) -> str:
     if not s: return ""
-    s = s.strip()
-    m = RE_EUR_NUMBER.search(s)
+    m = RE_EUR_NUMBER.search(s.strip())
     if not m: return ""
     n = m.group(0).replace(".", "").replace(",", ".")
     try:
         val = float(n)
-        # Schön formatiert zurückgeben („123.456 €“)
         return f"{val:,.0f} €".replace(",", ".")
     except:
         eur = RE_EUR_ANY.search(s)
         return eur.group(0) if eur else ""
 
 def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
-    """
-    Liest Preis aus JSON-LD (schema.org Offer -> price / priceCurrency), falls vorhanden.
-    """
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             data = json.loads(script.get_text(strip=True))
         except Exception:
             continue
-        # JSON-LD kann Objekt oder Liste sein
-        candidates = data if isinstance(data, list) else [data]
-        for node in candidates:
-            # Direkt Offer
-            if isinstance(node, dict):
-                offer = None
-                if node.get("@type") in ("Offer", "AggregateOffer"):
-                    offer = node
-                elif "offers" in node:
-                    offer = node["offers"]
-                if isinstance(offer, dict):
-                    price = offer.get("price") or offer.get("lowPrice")
-                    if price:
-                        try:
-                            val = float(str(price).replace(".", "").replace(",", "."))
-                            return f"{val:,.0f} €".replace(",", ".")
-                        except:
-                            pass
-                # Fallback: irgendwo price-Feld
-                for k in ("price", "lowPrice", "highPrice"):
-                    if k in node and node[k]:
-                        try:
-                            val = float(str(node[k]).replace(".", "").replace(",", "."))
-                            return f"{val:,.0f} €".replace(",", ".")
-                        except:
-                            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            offer = None
+            if node.get("@type") in ("Offer", "AggregateOffer"):
+                offer = node
+            elif "offers" in node:
+                offer = node["offers"]
+            if isinstance(offer, dict):
+                price = offer.get("price") or offer.get("lowPrice")
+                if price:
+                    try:
+                        val = float(str(price).replace(".", "").replace(",", "."))
+                        return f"{val:,.0f} €".replace(",", ".")
+                    except:
+                        pass
+            for k in ("price", "lowPrice", "highPrice"):
+                if k in node and node[k]:
+                    try:
+                        val = float(str(node[k]).replace(".", "").replace(",", "."))
+                        return f"{val:,.0f} €".replace(",", ".")
+                    except:
+                        continue
+    return ""
+
+def _normalize_spaces(s: str) -> str:
+    return re.sub(r"\s{2,}", " ", s or "").strip()
+
+def _panel_from_tablink(a_tag):
+    """Ermittle das Panel, auf das ein Tab-Link zeigt (href='#id' oder aria-controls)."""
+    href = (a_tag.get("href") or "").strip()
+    if href.startswith("#"):
+        panel = a_tag.find_parent().find_parent().find_next(id=href[1:])
+        if panel:
+            return panel
+    target = a_tag.get("aria-controls")
+    if target:
+        panel = a_tag.find_parent().find_parent().find_next(id=target)
+        if panel:
+            return panel
+    return None
+
+def _find_tab_navs(soup):
+    """Finde Tab-Navigationen und mappe (Label, Panel)."""
+    pairs = []
+    for nav in soup.select("ul, .nav, .tabs, .nav-tabs"):
+        for a in nav.select('a[href^="#"], a[aria-controls]'):
+            label = _normalize_spaces(a.get_text(" ", strip=True))
+            if not label:
+                continue
+            panel = _panel_from_tablink(a)
+            if panel:
+                pairs.append((label, panel))
+    return pairs
+
+def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
+    """Suche im Panel 'Objektangaben' nach Kaufpreis/Miete."""
+    tab_pairs = _find_tab_navs(soup)
+    target_panel = None
+    for label, panel in tab_pairs:
+        if any(alias.lower() in label.lower() for alias in TAB_LABELS["Objektangaben"]):
+            target_panel = panel
+            break
+    if not target_panel:
+        return ""
+    keys = ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")
+    for tr in target_panel.select("table tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
+        if len(cells) >= 2:
+            if any(k in cells[0].lower() for k in keys):
+                got = clean_price_string(cells[1])
+                if got: return got
+    for dt in target_panel.select("dl dt"):
+        dd = dt.find_next_sibling("dd")
+        label = (dt.get_text(" ", strip=True) or "").lower()
+        if any(k in label for k in keys):
+            got = clean_price_string(dd.get_text(" ", strip=True) if dd else "")
+            if got: return got
+    for li in target_panel.select("li"):
+        txt = li.get_text(" ", strip=True)
+        m = RE_PRICE_LINE.search(txt)
+        if m:
+            return clean_price_string(m.group(2) + " €")
     return ""
 
 def extract_price_dom(soup: BeautifulSoup) -> str:
-    # dt/dd
     for dt in soup.select("dt"):
         label = (dt.get_text(" ", strip=True) or "").lower()
-        if any(k in label for k in ("kaufpreis", "kaltmiete", "warmmiete", "nettokaltmiete", "miete", "preis")):
+        if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
             dd = dt.find_next_sibling("dd")
             if dd:
                 got = clean_price_string(dd.get_text(" ", strip=True))
                 if got: return got
-    # table tr th/td
     for tr in soup.select("table tr"):
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2:
             label = cells[0].lower()
-            if any(k in label for k in ("kaufpreis", "kaltmiete", "warmmiete", "nettokaltmiete", "miete", "preis")):
+            if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
                 got = clean_price_string(cells[1])
                 if got: return got
-    # label: value in Listen
     for li in soup.select("li"):
         txt = li.get_text(" ", strip=True)
         m = RE_PRICE_LINE.search(txt)
@@ -156,10 +212,6 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
     return ""
 
 def extract_price_strict_top(page_text: str) -> str:
-    """
-    Fallback: Suche NUR im oberen Seitenabschnitt (bis erste STOP_STRINGS),
-    und nimm die erste vernünftige €-Zahl (≥ 10.000).
-    """
     top = page_text
     for stop in STOP_STRINGS:
         pos = top.lower().find(stop.lower())
@@ -170,36 +222,28 @@ def extract_price_strict_top(page_text: str) -> str:
     euros_filtered = []
     for e in euros:
         num = RE_EUR_NUMBER.search(e)
-        if not num:
-            continue
+        if not num: continue
         try:
             val = float(num.group(0).replace(".", "").replace(",", "."))
-            if val >= 10000:  # realistische Untergrenze
-                euros_filtered.append(e)
-        except:
-            continue
+            if val >= 10000: euros_filtered.append(e)
+        except: continue
     if euros_filtered:
-        # Erste vernünftige Zahl im Kopfbereich
         return clean_price_string(euros_filtered[0])
     return ""
 
 def extract_price(soup: BeautifulSoup, page_text: str) -> str:
-    # 0) JSON-LD (präzise)
+    p = extract_price_from_objektangaben(soup)
+    if p: return p
     p = extract_price_from_jsonld(soup)
     if p: return p
-    # 1) Zeilenweise Label→Wert
-    for txt in page_text.splitlines():
-        txt = txt.strip()
-        m = RE_PRICE_LINE.search(txt)
+    for line in page_text.splitlines():
+        m = RE_PRICE_LINE.search(line.strip())
         if m:
             return clean_price_string(m.group(2) + " €")
-    # 2) DOM
     p = extract_price_dom(soup)
     if p: return p
-    # 3) Kopfbereich–Fallback
     p = extract_price_strict_top(page_text)
     if p: return p
-    # 4) letzter Fallback: größte Euro-Zahl im ganzen Dokument
     euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
     if euros:
         def to_float(e):
@@ -210,33 +254,66 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
         return clean_price_string(best)
     return ""
 
+# ---------------------------------------------------------------------------
+# Beschreibung aus allen 5 Tabs ziehen
+# ---------------------------------------------------------------------------
+def _is_stop_node(node):
+    cls = " ".join(node.get("class", []))
+    if any(k in cls for k in ("contact", "form", "sidebar", "widget")):
+        return True
+    txt = node.get_text(" ", strip=True) if hasattr(node, "get_text") else ""
+    return any(stop in txt for stop in STOP_STRINGS)
+
+def _harvest_panel(panel):
+    lines = []
+    for p in panel.select("p"):
+        t = _normalize_spaces(p.get_text(" ", strip=True))
+        if t and not any(stop in t for stop in STOP_STRINGS):
+            lines.append(t)
+    for li in panel.select("ul li, ol li"):
+        t = _normalize_spaces(li.get_text(" ", strip=True))
+        if t:
+            lines.append(f"• {t}")
+    for tr in panel.select("table tr"):
+        cells = [_normalize_spaces(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
+        if len(cells) >= 2:
+            if cells[0] or cells[1]:
+                lines.append(f"- {cells[0]}: {cells[1]}")
+        elif cells:
+            lines.append(" ".join(cells))
+    for dt in panel.select("dl dt"):
+        dd = dt.find_next_sibling("dd")
+        k = _normalize_spaces(dt.get_text(" ", strip=True))
+        v = _normalize_spaces(dd.get_text(" ", strip=True)) if dd else ""
+        if k or v:
+            lines.append(f"- {k}: {v}".strip(" -:"))
+    out, seen = [], set()
+    for ln in lines:
+        if ln and ln not in seen:
+            out.append(ln); seen.add(ln)
+        if len(out) >= 200:
+            break
+    return out
+
 def extract_description(soup: BeautifulSoup) -> str:
     """
-    Bevorzugt den Abschnitt unter einer H2/H3-Überschrift mit 'Beschreibung' o.ä.
-    Fallbacks: typische Content-Container, Meta/OG, Feature-Liste, dann erste <p> nach H1.
+    Baut die Beschreibung aus *allen* 5 MSI-Kacheln (Tabs):
+    Beschreibung, Objektangaben, Ausstattung, Lage, Energieausweis.
     """
-    # 1) Abschnitt anhand Überschrift
-    for h in soup.select("h2, h3"):
-        head = (h.get_text(" ", strip=True) or "").lower()
-        if any(k in head for k in SECTION_HEADERS):
-            chunks = []
-            for sib in h.find_all_next():
-                if sib.name in ("h2", "h3"):
+    parts = []
+    tab_pairs = _find_tab_navs(soup)  # [(label, panel), ...]
+    if tab_pairs:
+        for nice_name, aliases in TAB_LABELS.items():
+            for label, panel in tab_pairs:
+                if any(alias.lower() in label.lower() for alias in aliases):
+                    lines = _harvest_panel(panel)
+                    if lines:
+                        parts.append(f"{nice_name}:\n" + "\n".join(lines))
                     break
-                if sib.name == "p":
-                    t = sib.get_text(" ", strip=True)
-                    if t and not any(stop in t for stop in STOP_STRINGS):
-                        chunks.append(t)
-                if sib.has_attr("class"):
-                    cls = " ".join(sib.get("class"))
-                    if any(k in cls for k in ("contact", "form", "sidebar", "widget")):
-                        break
-                if len(chunks) >= 12:
-                    break
-            if chunks:
-                return "\n\n".join(chunks).strip()
+    if parts:
+        return ("\n\n".join(parts).strip())[:6000]
 
-    # 2) Content-Container
+    # Fallbacks, wenn keine Tabs erkennbar:
     candidates = soup.select(".entry-content, article, .content, .post-content, .single-content, [class*='content'], [class*='text']")
     for c in candidates:
         ps = [p.get_text(" ", strip=True) for p in c.select("p")]
@@ -244,56 +321,49 @@ def extract_description(soup: BeautifulSoup) -> str:
         if ps:
             return "\n\n".join(ps[:12]).strip()
 
-    # 3) OG/META-Description
     ogd = soup.select_one('meta[property="og:description"]')
     if ogd and ogd.get("content"):
         c = ogd["content"].strip()
-        if c:
-            return c
+        if c: return c
     md = soup.select_one('meta[name="description"]')
     if md and md.get("content"):
         c = md["content"].strip()
-        if c:
-            return c
+        if c: return c
 
-    # 4) Feature-Fallback (Zimmer/Schlafzimmer/Bäder etc.)
+    # Feature-Fallback
     features = []
     for li in soup.select("li"):
-        t = li.get_text(" ", strip=True)
-        if not t:
-            continue
-        if re.search(r"\b(zimmer|schlafzimmer|badezimmer|wohnfl|grundstück|nutzfl|balkon|terrasse|garage|stellplatz)\b", t, re.I):
+        t = _normalize_spaces(li.get_text(" ", strip=True))
+        if not t: continue
+        if re.search(r"\b(zimmer|schlafzimmer|badezimmer|wohnfl|wohnfläche|grundstück|nutzfl|balkon|terrasse|garage|stellplatz|baujahr|energie)\b", t, re.I):
             if not any(stop in t for stop in STOP_STRINGS):
                 features.append(t)
     features = list(dict.fromkeys(features))
     if features:
-        return " • ".join(features[:12])
+        return " • ".join(features[:20])
 
-    # 5) erste <p> nach H1
+    # letzte Rettung: <p> nach H1
     h1 = soup.select_one("h1")
     if h1:
         ps = []
         for sib in h1.find_all_next():
             if sib.name == "p":
-                t = sib.get_text(" ", strip=True)
+                t = _normalize_spaces(sib.get_text(" ", strip=True))
                 if t and not any(stop in t for stop in STOP_STRINGS):
                     ps.append(t)
-                if len(ps) >= 8:
-                    break
+                if len(ps) >= 8: break
         if ps:
             return "\n\n".join(ps).strip()
 
     return ""
 
+# ---------------------------------------------------------------------------
+# Detail-Parser
+# ---------------------------------------------------------------------------
 def extract_plz_ort(page_text: str) -> str:
-    """
-    Liefert NUR 'PLZ Ort' (ohne zusätzlichen Satz/Beifang).
-    """
     m = RE_PLZ_ORT_STRICT.search(page_text)
-    if not m:
-        return ""
+    if not m: return ""
     plz, ort = m.group(1), m.group(2)
-    # Ort hart säubern (bis zum ersten Trennzeichen)
     ort = re.split(r"[|,•·\-\–—/()]", ort)[0].strip()
     ort = re.sub(r"\s{2,}", " ", ort)
     return f"{plz} {ort}"
@@ -306,7 +376,7 @@ def parse_detail(detail_url: str, mode: str):
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
-    # Beschreibung (robust)
+    # Beschreibung
     description = extract_description(soup)
 
     # Objektnummer
@@ -316,10 +386,10 @@ def parse_detail(detail_url: str, mode: str):
     # Preis
     preis_value = extract_price(soup, page_text)
 
-    # Ort (nur 'PLZ Ort')
+    # Ort
     ort = extract_plz_ort(page_text)
 
-    # Bild (externes Galerie-Link bevorzugt)
+    # Bild (Galerie-Link bevorzugt)
     image_url = ""
     a_img = soup.select_one('a[href*="immo."]') or soup.select_one('a[href*="screenwork"]')
     if a_img and a_img.has_attr("href"):
@@ -329,7 +399,7 @@ def parse_detail(detail_url: str, mode: str):
         if img and img.has_attr("src"):
             image_url = urljoin(BASE, img["src"])
 
-    # Kategorie aus Detailtext erkennen
+    # Kategorie
     kategorie_detected = detect_category(page_text)
 
     return {
@@ -344,13 +414,13 @@ def parse_detail(detail_url: str, mode: str):
     }
 
 # ---------------------------------------------------------------------------
-# Heuristiken/Klassifikation
+# Unterkategorie (Wohnung/Haus/…)
 # ---------------------------------------------------------------------------
-KEYS_WOHNUNG    = ["wohnung", "etagenwohnung", "eigentumswohnung", "apartment", "dachgeschoss", "maisonette", "penthouse", "balkon"]
-KEYS_HAUS       = ["haus", "einfamilienhaus", "zweifamilienhaus", "reihenhaus", "doppelhaushälfte", "stadtvilla", "mehrfamilienhaus", "dhh"]
-KEYS_GEWERBE    = ["gewerbe", "büro", "laden", "praxis", "lager", "halle", "gastronomie", "gewerbeeinheit", "gewerbefläche"]
-KEYS_KAPITAL    = ["kapitalanlage", "rendite", "vermietet", "anlageobjekt", "investment"]
-KEYS_STELLPLATZ = ["stellplatz", "parkplatz", "tiefgarage", "garage", "carport"]
+KEYS_WOHNUNG    = ["wohnung","etagenwohnung","eigentumswohnung","apartment","dachgeschoss","maisonette","penthouse","balkon"]
+KEYS_HAUS       = ["haus","einfamilienhaus","zweifamilienhaus","reihenhaus","doppelhaushälfte","stadtvilla","mehrfamilienhaus","dhh"]
+KEYS_GEWERBE    = ["gewerbe","büro","laden","praxis","lager","halle","gastronomie","gewerbeeinheit","gewerbefläche"]
+KEYS_KAPITAL    = ["kapitalanlage","rendite","vermietet","anlageobjekt","investment"]
+KEYS_STELLPLATZ = ["stellplatz","parkplatz","tiefgarage","garage","carport"]
 
 def heuristic_subcategory(row):
     text = f"{row.get('Titel','')} {row.get('Description','')}".lower()
@@ -359,16 +429,14 @@ def heuristic_subcategory(row):
     for k in KEYS_HAUS:     score["Haus"]          += text.count(k)
     for k in KEYS_GEWERBE:  score["Gewerbe"]       += text.count(k)
     for k in KEYS_KAPITAL:  score["Kapitalanlage"] += text.count(k)
-
     if score["Kapitalanlage"] >= 2: return "Kapitalanlage"
     if score["Gewerbe"] >= 2:       return "Gewerbe"
     if score["Haus"] >= 2 and score["Wohnung"] == 0: return "Haus"
     if score["Wohnung"] >= 2 and score["Haus"] == 0: return "Wohnung"
-
     best = max(score, key=score.get)
     if score[best] >= 2 and list(score.values()).count(score[best]) == 1:
         return best
-    return "Haus"  # pragmatischer Fallback
+    return "Haus"
 
 def gpt_category(row):
     if not USE_GPT_CLASSIFY or not OPENAI_API_KEY:
@@ -376,19 +444,15 @@ def gpt_category(row):
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = (
-            "Klassifiziere dieses Immobilien-Exposé in genau eine Kategorie:\n"
-            "Wohnung, Haus, Gewerbe, Kapitalanlage.\n"
-            "Gib nur das Wort aus.\n\n"
-            f"Titel: {row.get('Titel','')}\n"
-            f"Beschreibung: {row.get('Description','')}\n"
-        )
+        prompt = ("Klassifiziere dieses Immobilien-Exposé in genau eine Kategorie:\n"
+                  "Wohnung, Haus, Gewerbe, Kapitalanlage.\n"
+                  "Gib nur das Wort aus.\n\n"
+                  f"Titel: {row.get('Titel','')}\n"
+                  f"Beschreibung: {row.get('Description','')}\n")
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role":"system","content":"Du bist ein präziser Immobilien-Klassifizierer."},
-                {"role":"user","content": prompt}
-            ],
+            messages=[{"role":"system","content":"Du bist ein präziser Immobilien-Klassifizierer."},
+                      {"role":"user","content": prompt}],
             temperature=0
         )
         out = (resp.choices[0].message.content or "").strip().lower()
@@ -406,7 +470,7 @@ def decide_subcategory(row):
     return "Haus"
 
 # ---------------------------------------------------------------------------
-# Airtable API – Helpers (identisch zur Werneburg-Logik)
+# Airtable API – Helpers
 # ---------------------------------------------------------------------------
 def airtable_table_segment():
     if AIRTABLE_TABLE_ID:
@@ -430,8 +494,7 @@ def airtable_headers():
 def airtable_existing_fields():
     url = airtable_api_url()
     params = {"maxRecords": 1}
-    if AIRTABLE_VIEW:
-        params["view"] = AIRTABLE_VIEW
+    if AIRTABLE_VIEW: params["view"] = AIRTABLE_VIEW
     r = requests.get(url, headers=airtable_headers(), params=params, timeout=30)
     if not r.ok:
         print(f"[Airtable] Schema-Check Warnung {r.status_code}: {r.text[:400]}")
@@ -481,8 +544,7 @@ def airtable_list_all():
     ids, fields = [], []
     url = airtable_api_url()
     params = {}
-    if AIRTABLE_VIEW:
-        params["view"] = AIRTABLE_VIEW
+    if AIRTABLE_VIEW: params["view"] = AIRTABLE_VIEW
     while True:
         r = requests.get(url, headers=airtable_headers(), params=params, timeout=60)
         if not r.ok:
@@ -492,8 +554,7 @@ def airtable_list_all():
             ids.append(rec["id"])
             fields.append(rec.get("fields", {}))
         offset = data.get("offset")
-        if not offset:
-            break
+        if not offset: break
         params["offset"] = offset
         time.sleep(0.2)
     return ids, fields
@@ -502,22 +563,33 @@ def airtable_list_all():
 # Felder/Keys
 # ---------------------------------------------------------------------------
 def parse_price_to_number(label: str):
+    """
+    Robuste Normalisierung:
+    - '134.900 €'  -> 134900.0  (Punkte = Tausender)
+    - '1.234,56'   -> 1234.56   (EU-Format)
+    """
     if not label:
         return None
-    cleaned = re.sub(r"[^\d,\.]", "", label)
-    if "," in cleaned and "." in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".")
-    elif "," in cleaned and "." not in cleaned:
-        cleaned = cleaned.replace(",", ".")
+    s = re.sub(r"[^\d\.,]", "", label).strip()
+    if not s:
+        return None
+    if "." in s and "," not in s:
+        last = s.rsplit(".", 1)[-1]
+        if last.isdigit() and len(last) in (3, 6):
+            s = s.replace(".", "")
+    elif "," in s and "." not in s:
+        s = s.replace(",", ".")
+    elif "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
     try:
-        return float(cleaned)
+        return float(s)
     except Exception:
         return None
 
 def make_record(row, unterkat):
     return {
         "Titel":           row["Titel"],
-        "Kategorie":       row["KategorieDetected"],   # Wichtig: aus Detail erkannt („Kaufen“/„Mieten“)
+        "Kategorie":       row["KategorieDetected"],   # „Kaufen“/„Mieten“
         "Unterkategorie":  unterkat,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
@@ -529,15 +601,13 @@ def make_record(row, unterkat):
 
 def unique_key(fields: dict) -> str:
     obj = (fields.get("Objektnummer") or "").strip()
-    if obj:
-        return f"obj:{obj}"
+    if obj: return f"obj:{obj}"
     url = (fields.get("Webseite") or "").strip()
-    if url:
-        return f"url:{url}"
+    if url: return f"url:{url}"
     return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
 
 # ---------------------------------------------------------------------------
-# Sync-Logik (Upsert) je Kategorie
+# Upsert je Kategorie
 # ---------------------------------------------------------------------------
 def sync_category(scraped_rows, category_label: str):
     allowed = airtable_existing_fields()
@@ -579,7 +649,7 @@ def run(mode: str):
     Modi:
       - 'kauf'  : nur Kaufen-Sätze schreiben/syncen
       - 'miete' : nur Mieten-Sätze schreiben/syncen
-      - 'auto'  : beides erkennen; zwei CSVs; zwei Upserts
+      - 'auto'  : beide erkennen; zwei CSVs; zwei Upserts
     """
     assert mode in ("kauf", "miete", "auto"), "Mode muss 'kauf', 'miete' oder 'auto' sein."
     csv_kauf  = "msi_kauf.csv"
@@ -604,11 +674,10 @@ def run(mode: str):
             try:
                 row = parse_detail(url, mode)
 
-                # --- NEU: Skip, wenn im Titel "verkauft" steht ---
+                # Skip, wenn Titel „verkauft“ enthält
                 if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
                     print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
                     continue
-                # -------------------------------------------------
 
                 unterkat = decide_subcategory(row)
                 record = make_record(row, unterkat)
@@ -627,13 +696,9 @@ def run(mode: str):
     rows_kauf  = [r for r in all_rows if r["Kategorie"] == "Kaufen"]
     rows_miete = [r for r in all_rows if r["Kategorie"] == "Mieten"]
 
-    # Filter je nach Modus
-    if mode == "kauf":
-        rows_miete = []
-    elif mode == "miete":
-        rows_kauf = []
+    if mode == "kauf":  rows_miete = []
+    if mode == "miete": rows_kauf  = []
 
-    # CSVs schreiben
     cols = ["Titel","Kategorie","Unterkategorie","Webseite","Objektnummer","Beschreibung","Bild","Preis","Standort"]
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
@@ -644,12 +709,9 @@ def run(mode: str):
             w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows_miete)
         print(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
 
-    # Upsert je Kategorie
     if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
-        if rows_kauf:
-            sync_category(rows_kauf, "Kaufen")
-        if rows_miete:
-            sync_category(rows_miete, "Mieten")
+        if rows_kauf:  sync_category(rows_kauf, "Kaufen")
+        if rows_miete: sync_category(rows_miete, "Mieten")
     else:
         print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
 
