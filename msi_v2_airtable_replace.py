@@ -62,9 +62,11 @@ RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Z
 RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
 RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
-# keine aggressive Stops mehr (damit Absätze mit „Kontaktieren…“ erhalten bleiben)
-STOP_STRINGS = ("Ihre Anfrage", "Exposé anfordern", "Neueste Immobilien", "Teilen auf",
-                "Datenschutz", "Impressum")
+# Wichtige Stop-Phrasen (Footer etc.)
+STOP_STRINGS = (
+    "Ihre Anfrage", "Exposé anfordern", "Neueste Immobilien", "Teilen auf",
+    "Datenschutz", "Impressum", "designed by wavepoint"
+)
 
 TAB_LABELS = {
     "Beschreibung":   ("beschreibung",),
@@ -323,9 +325,8 @@ SECTION_ALIASES = {
 def _clean_lines(lines):
     out, seen = [], set()
     for t in lines:
-        if not t: 
+        if not t:
             continue
-        # Stop-Wörter entfernen
         if any(s.lower() in t.lower() for s in STOP_STRINGS):
             continue
         t = _norm(t)
@@ -333,110 +334,106 @@ def _clean_lines(lines):
             out.append(t); seen.add(t)
     return out
 
-def _collect_following_until_next_h4(header_p: Tag) -> list[str]:
-    """Sammelt Texte (p, li, table/dl) nach einem <p class='h4'> bis zur nächsten <p class='h4'>."""
+def _find_expose_container(soup: BeautifulSoup) -> Tag | None:
+    """
+    Begrenzt die Suche auf den eigentlichen Exposé-Bereich (Vuetify).
+    """
+    cand = soup.select_one(".v-expose")
+    if cand:
+        return cand
+    for sel in [
+        'div[id*="expose"]', 'section[id*="expose"]',
+        '.immo-listing_infotext', '.expose', '.exposé'
+    ]:
+        cand = soup.select_one(sel)
+        if cand:
+            return cand
+    return soup  # letzter Fallback
+
+def _collect_until_next_h4(start: Tag, scope: Tag) -> list[str]:
+    """Sammelt Texte nach <p.h4> bis zur nächsten <p.h4>, bleibt im scope."""
     lines = []
-    for sib in header_p.next_siblings:
-        if isinstance(sib, Tag) and "h4" in (sib.get("class") or []):
-            break  # nächster Abschnitt beginnt
-        if isinstance(sib, Tag):
-            # Absätze
-            if sib.name == "p":
-                txt = _norm(sib.get_text(" ", strip=True))
-                if txt:
-                    lines.append(txt)
-            # Listen
-            for li in sib.select("ul li, ol li"):
+    node = start.next_sibling
+    while node:
+        if isinstance(node, Tag) and node is scope:
+            break
+        if isinstance(node, Tag):
+            # Abschnitt beendet?
+            if node.name == "p" and "h4" in (node.get("class") or []):
+                break
+            if node.name == "p":
+                txt = _norm(node.get_text(" ", strip=True))
+                if txt: lines.append(txt)
+            for li in node.select("ul li, ol li"):
                 t = _norm(li.get_text(" ", strip=True))
                 if t: lines.append(f"• {t}")
-            # Tabellen & DL
-            for tr in sib.select("table tr"):
+            for tr in node.select("table tr"):
                 cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
-                if len(cells) >= 2:
-                    lines.append(f"- {cells[0]}: {cells[1]}")
-                elif cells:
-                    lines.append(" ".join(cells))
-            for dt in sib.select("dl dt"):
+                if len(cells) >= 2: lines.append(f"- {cells[0]}: {cells[1]}")
+                elif cells: lines.append(" ".join(cells))
+            for dt in node.select("dl dt"):
                 dd = dt.find_next_sibling("dd")
                 k = _norm(dt.get_text(" ", strip=True))
                 v = _norm(dd.get_text(" ", strip=True)) if dd else ""
-                if k or v:
-                    lines.append(f"- {k}: {v}".strip(" -:"))
-        elif isinstance(sib, NavigableString):
-            t = _norm(str(sib))
-            if t:
-                lines.append(t)
+                if (k or v): lines.append(f"- {k}: {v}".strip(" -:"))
+        elif isinstance(node, NavigableString):
+            t = _norm(str(node))
+            if t: lines.append(t)
+        node = node.next_sibling
     return _clean_lines(lines)
 
 def extract_description(soup: BeautifulSoup) -> str:
     """
-    Holt Inhalte aus MSI-Detailseiten (Vuetify):
-      - Erster Versuch: Container .v-card__text mit <p.h4> Überschrift.
-      - Zweiter Versuch: überall im DOM <p.h4> Abschnitte sequenziell auslesen.
-      - Fallbacks: generische Content-Bereiche & Meta-Description.
-    Ergebnis: Ein einziges Feld mit Abschnittstiteln + Inhalten.
+    Liest die MSI-Tabs:
+      - nur im Exposé-Container
+      - <p class="h4">-Abschnitte + nachfolgende Inhalte bis zur nächsten h4
+      - sauberes Zusammenführen zu einem Feld
     """
-    collected_sections = []
+    scope = _find_expose_container(soup)
+    sections = []
 
-    # 1) MSI/Vuetify Standard: .v-card__text Container
-    for box in soup.select(".v-card__text"):
+    # 1) bevorzugt: strukturierte Kacheln
+    for box in scope.select(".v-card__text"):
         head = box.select_one("p.h4")
-        if not head: 
+        if not head:
             continue
         title = _norm(head.get_text(" ", strip=True)).lower()
-        # Aliase prüfen
-        for sect_name, aliases in SECTION_ALIASES.items():
+        for key, aliases in SECTION_ALIASES.items():
             if title in aliases:
-                lines = _collect_following_until_next_h4(head)
+                lines = _collect_until_next_h4(head, box)
                 if lines:
-                    collected_sections.append((sect_name.capitalize(), lines))
+                    sections.append((key.capitalize(), lines))
                 break
 
-    # 2) Falls nichts gefunden: überall im DOM die <p class="h4">-Überschriften linear parsen
-    if not collected_sections:
-        for p in soup.find_all("p", class_="h4"):
-            title = _norm(p.get_text(" ", strip=True)).lower()
-            for sect_name, aliases in SECTION_ALIASES.items():
+    # 2) falls nichts: alle <p.h4> im scope linear
+    if not sections:
+        for h in scope.select("p.h4"):
+            title = _norm(h.get_text(" ", strip=True)).lower()
+            for key, aliases in SECTION_ALIASES.items():
                 if title in aliases:
-                    lines = _collect_following_until_next_h4(p)
+                    lines = _collect_until_next_h4(h, scope)
                     if lines:
-                        collected_sections.append((sect_name.capitalize(), lines))
+                        sections.append((key.capitalize(), lines))
                     break
 
-    # 3) Zusätzlicher Versuch: Vuetify v-window-item Panels (falls Struktur abweicht)
-    if not collected_sections:
-        for item in soup.select(".v-window-item"):
-            head = item.select_one("p.h4")
-            if not head: 
-                continue
-            title = _norm(head.get_text(" ", strip=True)).lower()
-            for sect_name, aliases in SECTION_ALIASES.items():
-                if title in aliases:
-                    lines = _collect_following_until_next_h4(head)
-                    if lines:
-                        collected_sections.append((sect_name.capitalize(), lines))
-                    break
-
-    # 4) Generische Fallbacks
-    if collected_sections:
-        parts = []
-        for title, lines in collected_sections:
-            parts.append(f"{title}:\n" + "\n".join(lines))
+    if sections:
+        parts = [f"{t}:\n" + "\n".join(ls) for t, ls in sections]
         return ("\n\n".join(parts).strip())[:6000]
 
-    for c in soup.select(".entry-content, article, .content, .post-content, .single-content, [class*='content'], [class*='text']"):
-        ps = [p.get_text(" ", strip=True) for p in c.select("p")]
-        ps = _clean_lines(ps)
-        if ps:
-            return "\n\n".join(ps[:12]).strip()
+    # 3) generischer Fallback nur im scope
+    generic = []
+    for p in scope.select("p"):
+        txt = _norm(p.get_text(" ", strip=True))
+        if txt and not any(s.lower() in txt.lower() for s in STOP_STRINGS):
+            generic.append(txt)
+    if generic:
+        return "\n\n".join(generic[:12]).strip()
 
+    # 4) absolute Fallbacks
     ogd = soup.select_one('meta[property="og:description"]')
-    if ogd and ogd.get("content"):
-        return ogd["content"].strip()
+    if ogd and ogd.get("content"): return ogd["content"].strip()
     md = soup.select_one('meta[name="description"]')
-    if md and md.get("content"):
-        return md["content"].strip()
-
+    if md and md.get("content"):   return md["content"].strip()
     return ""
 
 # ---------------------------------------------------------------------------
@@ -487,7 +484,7 @@ def parse_detail(detail_url: str, mode: str):
     return {
         "Titel":        title,
         "URL":          detail_url,
-        "Description":  description,   # <— jetzt zuverlässig gefüllt
+        "Description":  description,
         "Objektnummer": objektnummer,
         "Preis":        preis_value,
         "Ort":          ort,
@@ -654,7 +651,7 @@ def make_record(row, unterkat):
         "Unterkategorie":  unterkat,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
-        "Beschreibung":    row["Description"],   # <— jetzt gefüllt
+        "Beschreibung":    row["Description"],   # jetzt gefüllt
         "Bild":            row["Bild_URL"],
         "Preis":           preis_value,
         "Standort":        row["Ort"],
