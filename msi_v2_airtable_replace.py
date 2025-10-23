@@ -502,18 +502,21 @@ def run(mode: str):
         seen.update(new_links)
         print(f"[Seite {idx}] {len(new_links)} neue Detailseiten")
 
-        for j, url in enumerate(new_links, 1):
-            try:
-                row = parse_detail(url, mode)
-                unterkat = decide_subcategory(row)
-                record = make_record(row, unterkat)
-                all_rows.append(record)
-                print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
-                time.sleep(0.15)
-            except Exception as e:
-                print(f"    [FEHLER] {url} -> {e}")
-                continue
-        time.sleep(0.25)
+   for j, url in enumerate(new_links, 1):
+    try:
+        row = parse_detail(url, mode)
+
+        # --- NEU: Skip, wenn im Titel "verkauft" steht ---
+        if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
+            print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
+            continue
+        # -------------------------------------------------
+
+        unterkat = decide_subcategory(row)
+        record = make_record(row, unterkat)
+        all_rows.append(record)
+        print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
+        time.sleep(0.15)
 
     if not all_rows:
         print("[WARN] Keine Datensätze gefunden.")
