@@ -41,22 +41,33 @@ def get_list_page_urls(mode: str, max_pages: int = 50):
     return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
 
 def collect_detail_links(list_url: str):
+    """
+    Sammelt alle Detail-URLs unter /angebote/...; dedupliziert.
+    """
     soup = soup_get(list_url)
     links = set()
     for a in soup.select('a[href*="/angebote/"]'):
         href = a.get("href")
-        if href:
-            links.add(href if href.startswith("http") else urljoin(BASE, href))
+        if not href:
+            continue
+        if not href.startswith("http"):
+            href = urljoin(BASE, href)
+        links.add(href)
     return list(links)
 
 # ---------------------------------------------------------------------------
-# Detail-Parser
+# Detail-Parser – robuste Extraktion für Preis / Beschreibung / Ort
 # ---------------------------------------------------------------------------
-RE_PRICE_EUR = re.compile(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})?\s*€")
-RE_OBJEKTNR  = re.compile(r"Objekt[-\s]?Nr\.?:\s*([A-Za-z0-9\-_/]+)")
-RE_PLZ_ORT   = re.compile(r"\b([0-9]{5}\s+[A-Za-zÄÖÜäöüß\-\s]+)\b")
-RE_KAUF      = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
-RE_MIETE     = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
+RE_EUR_ANY        = re.compile(r"\b\d{1,3}(?:\.\d{3})*(?:,\d{2})?\s*€")
+RE_EUR_NUMBER     = re.compile(r"\b\d{1,3}(?:\.\d{3})*(?:,\d{2})?\b")
+RE_PRICE_LINE     = re.compile(r"(kaufpreis|preis|kaltmiete|warmmiete|nettokaltmiete|miete)\s*:?\s*([0-9\.\,]+)\s*€?", re.I)
+RE_OBJEKTNR       = re.compile(r"Objekt[-\s]?Nr\.?:\s*([A-Za-z0-9\-_/]+)")
+RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß\-\s]+?)\b(?![A-Za-zÄÖÜäöüß])")
+
+RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
+RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
+
+SECTION_HEADERS = ("beschreibung", "objektbeschreibung", "ausstattung", "lage", "sonstiges", "weitere informationen")
 
 def detect_category(page_text: str) -> str:
     if RE_MIETE.search(page_text):
@@ -66,6 +77,129 @@ def detect_category(page_text: str) -> str:
     # Heuristik: ohne Mietbegriffe → eher Kauf
     return "Kaufen"
 
+def clean_price_string(s: str) -> str:
+    if not s: return ""
+    s = s.strip()
+    m = RE_EUR_NUMBER.search(s)
+    if not m: return ""
+    n = m.group(0).replace(".", "").replace(",", ".")
+    try:
+        val = float(n)
+        # Schön formatiert zurückgeben („123.456 €“)
+        return f"{val:,.0f} €".replace(",", ".")
+    except:
+        eur = RE_EUR_ANY.search(s)
+        return eur.group(0) if eur else ""
+
+def extract_price(soup: BeautifulSoup, page_text: str) -> str:
+    # 1) Zeilenweise Label→Wert (Kaufpreis: 325.000 €)
+    for txt in page_text.splitlines():
+        txt = txt.strip()
+        m = RE_PRICE_LINE.search(txt)
+        if m:
+            return clean_price_string(m.group(2) + " €")
+
+    # 2) DOM: dt/dd
+    for dt in soup.select("dt"):
+        label = (dt.get_text(" ", strip=True) or "").lower()
+        if any(k in label for k in ("kaufpreis", "kaltmiete", "warmmiete", "nettokaltmiete", "miete", "preis")):
+            dd = dt.find_next_sibling("dd")
+            if dd:
+                got = clean_price_string(dd.get_text(" ", strip=True))
+                if got: return got
+
+    # 3) DOM: table tr th/td
+    for tr in soup.select("table tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+        if len(cells) >= 2:
+            label = cells[0].lower()
+            if any(k in label for k in ("kaufpreis", "kaltmiete", "warmmiete", "nettokaltmiete", "miete", "preis")):
+                got = clean_price_string(cells[1])
+                if got: return got
+
+    # 4) DOM: Listen
+    for li in soup.select("li"):
+        txt = li.get_text(" ", strip=True)
+        m = RE_PRICE_LINE.search(txt)
+        if m:
+            return clean_price_string(m.group(2) + " €")
+
+    # 5) Fallback: größte Euro-Zahl im Dokument
+    euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
+    if euros:
+        def to_float(e):
+            n = RE_EUR_NUMBER.search(e).group(0).replace(".", "").replace(",", ".")
+            try: return float(n)
+            except: return 0.0
+        best = max(euros, key=to_float)
+        return clean_price_string(best)
+
+    return ""
+
+def extract_description(soup: BeautifulSoup) -> str:
+    """
+    Bevorzugt den Abschnitt unter einer H2/H3-Überschrift mit 'Beschreibung' o.ä.
+    Fallback: typische Content-Container; danach erste P-Blöcke nach dem H1.
+    Filtert Anfrage-/Formular-/Sidebar-Texte heraus.
+    """
+    # 1) Abschnitt anhand Überschrift
+    for h in soup.select("h2, h3"):
+        head = (h.get_text(" ", strip=True) or "").lower()
+        if any(k in head for k in SECTION_HEADERS):
+            chunks = []
+            for sib in h.find_all_next():
+                if sib.name in ("h2", "h3"):
+                    break
+                if sib.name == "p":
+                    t = sib.get_text(" ", strip=True)
+                    if t and not any(stop in t for stop in ("Ihre Anfrage", "Kontakt", "Exposé anfordern")):
+                        chunks.append(t)
+                if sib.has_attr("class"):
+                    cls = " ".join(sib.get("class"))
+                    if any(k in cls for k in ("contact", "form", "sidebar", "widget")):
+                        break
+                if len(chunks) >= 12:
+                    break
+            if chunks:
+                return "\n\n".join(chunks).strip()
+
+    # 2) Fallback – typische Content-Container
+    candidates = soup.select(".entry-content, article, .content, .post-content, .single-content")
+    for c in candidates:
+        ps = [p.get_text(" ", strip=True) for p in c.select("p")]
+        ps = [p for p in ps if p and not any(stop in p for stop in ("Ihre Anfrage", "Kontakt", "Exposé anfordern"))]
+        if ps:
+            return "\n\n".join(ps[:12]).strip()
+
+    # 3) Fallback – erste 8 <p> nach H1
+    h1 = soup.select_one("h1")
+    if h1:
+        ps = []
+        for sib in h1.find_all_next():
+            if sib.name == "p":
+                t = sib.get_text(" ", strip=True)
+                if t and not any(stop in t for stop in ("Ihre Anfrage", "Kontakt", "Exposé anfordern")):
+                    ps.append(t)
+                if len(ps) >= 8:
+                    break
+        if ps:
+            return "\n\n".join(ps).strip()
+
+    return ""
+
+def extract_plz_ort(page_text: str) -> str:
+    """
+    Liefert NUR 'PLZ Ort' (ohne zusätzlichen Satz/Beifang).
+    """
+    m = RE_PLZ_ORT_STRICT.search(page_text)
+    if not m:
+        return ""
+    plz, ort = m.group(1), m.group(2)
+    # Ort hart säubern (bis zum ersten Trennzeichen)
+    ort = re.split(r"[|,•·\-\–—/()]", ort)[0].strip()
+    ort = re.sub(r"\s{2,}", " ", ort)
+    return f"{plz} {ort}"
+
 def parse_detail(detail_url: str, mode: str):
     soup = soup_get(detail_url)
     page_text = soup.get_text("\n", strip=True)
@@ -74,33 +208,18 @@ def parse_detail(detail_url: str, mode: str):
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
-    # Beschreibung: erste sinnvollen Absätze nach H1
-    description = ""
-    if h1:
-        parts = []
-        for sib in h1.find_all_next():
-            if sib.name == "p":
-                t = sib.get_text(" ", strip=True)
-                if not t:
-                    continue
-                if any(stop in t for stop in ("Ihre Anfrage", "Neueste Immobilien", "Kontakt", "Exposé anfordern")):
-                    break
-                parts.append(t)
-                if len(parts) >= 10:
-                    break
-        description = "\n\n".join(parts).strip()
+    # Beschreibung (robust)
+    description = extract_description(soup)
 
     # Objektnummer
     m_obj = RE_OBJEKTNR.search(page_text)
     objektnummer = m_obj.group(1).strip() if m_obj else ""
 
     # Preis
-    m_price = RE_PRICE_EUR.search(page_text)
-    preis_value = m_price.group(0) if m_price else ""
+    preis_value = extract_price(soup, page_text)
 
-    # Ort (PLZ + Ort)
-    m_ort = RE_PLZ_ORT.search(page_text)
-    ort = m_ort.group(1).strip() if m_ort else ""
+    # Ort (nur 'PLZ Ort')
+    ort = extract_plz_ort(page_text)
 
     # Bild (externes Galerie-Link bevorzugt)
     image_url = ""
@@ -189,7 +308,7 @@ def decide_subcategory(row):
     return "Haus"
 
 # ---------------------------------------------------------------------------
-# Airtable API – Helpers
+# Airtable API – Helpers (identisch zur Werneburg-Logik)
 # ---------------------------------------------------------------------------
 def airtable_table_segment():
     if AIRTABLE_TABLE_ID:
@@ -300,7 +419,7 @@ def parse_price_to_number(label: str):
 def make_record(row, unterkat):
     return {
         "Titel":           row["Titel"],
-        "Kategorie":       row["KategorieDetected"],   # Wichtig: aus Detail erkannt
+        "Kategorie":       row["KategorieDetected"],   # Wichtig: aus Detail erkannt („Kaufen“/„Mieten“)
         "Unterkategorie":  unterkat,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
@@ -320,7 +439,7 @@ def unique_key(fields: dict) -> str:
     return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
 
 # ---------------------------------------------------------------------------
-# Sync-Logik
+# Sync-Logik (Upsert) je Kategorie
 # ---------------------------------------------------------------------------
 def sync_category(scraped_rows, category_label: str):
     allowed = airtable_existing_fields()
