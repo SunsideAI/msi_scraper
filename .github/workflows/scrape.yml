@@ -1,0 +1,47 @@
+name: MSI Scraper
+
+on:
+  schedule:
+    # Läuft jeden Tag um 07:00 UTC (09:00 deutsche Zeit)
+    - cron: "0 7 * * *"
+  workflow_dispatch:  # Manuelles Starten möglich
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          pip install requests beautifulsoup4 lxml openai
+
+      - name: Scrape Miete (Upsert)
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
+          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python werneburg_v2_airtable_replace.py miete
+
+      - name: Scrape Kauf (Upsert)
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
+          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python werneburg_v2_airtable_replace.py kauf
+
+      - name: Upload CSV Artefakte
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraped-data
+          path: |
+            werneburg_miete.csv
+            werneburg_kauf.csv
