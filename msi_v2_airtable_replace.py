@@ -32,10 +32,6 @@ def soup_get(url: str) -> BeautifulSoup:
     return BeautifulSoup(r.text, "lxml")
 
 def get_list_page_urls(mode: str, max_pages: int = 50):
-    """
-    MSI listet Kauf & Miete gemeinsam unter /kaufen/immobilienangebote/, paginiert mit /page/{n}/
-    -> Für alle Modi dieselbe Listing-Quelle.
-    """
     first = f"{BASE}/kaufen/immobilienangebote/"
     pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
     return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
@@ -63,9 +59,6 @@ RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b
 
 STOP_STRINGS = ("Ihre Anfrage", "Kontakt", "Exposé anfordern", "Neueste Immobilien")
 
-SECTION_HEADERS = ("beschreibung", "objektbeschreibung", "ausstattung", "lage", "sonstiges", "weitere informationen")
-
-# Für Tab-Auswertung:
 TAB_LABELS = {
     "Beschreibung":   ("Beschreibung",),
     "Objektangaben":  ("Objektangaben","Objektdaten","Daten"),
@@ -75,16 +68,17 @@ TAB_LABELS = {
 }
 
 # ---------------------------------------------------------------------------
-# Kategorie-Erkennung (Kaufen/Mieten)
+# Utils
 # ---------------------------------------------------------------------------
+def _norm(s: str) -> str:
+    return re.sub(r"\s{2,}", " ", (s or "").strip())
+
 def detect_category(page_text: str) -> str:
     if RE_MIETE.search(page_text): return "Mieten"
     if RE_KAUF.search(page_text):  return "Kaufen"
     return "Kaufen"
 
-# ---------------------------------------------------------------------------
-# Preis-Extraktion
-# ---------------------------------------------------------------------------
+# -------------------- Preis-Parsing --------------------
 def clean_price_string(s: str) -> str:
     if not s: return ""
     m = RE_EUR_NUMBER.search(s.strip())
@@ -129,11 +123,7 @@ def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
                         continue
     return ""
 
-def _normalize_spaces(s: str) -> str:
-    return re.sub(r"\s{2,}", " ", s or "").strip()
-
 def _panel_from_tablink(a_tag):
-    """Ermittle das Panel, auf das ein Tab-Link zeigt (href='#id' oder aria-controls)."""
     href = (a_tag.get("href") or "").strip()
     if href.startswith("#"):
         panel = a_tag.find_parent().find_parent().find_next(id=href[1:])
@@ -147,11 +137,11 @@ def _panel_from_tablink(a_tag):
     return None
 
 def _find_tab_navs(soup):
-    """Finde Tab-Navigationen und mappe (Label, Panel)."""
     pairs = []
-    for nav in soup.select("ul, .nav, .tabs, .nav-tabs"):
+    # Kadence / Elementor / generisch
+    for nav in soup.select(".kt-tabs-title-list, .nav-tabs, .elementor-tabs-wrapper, ul"):
         for a in nav.select('a[href^="#"], a[aria-controls]'):
-            label = _normalize_spaces(a.get_text(" ", strip=True))
+            label = _norm(a.get_text(" ", strip=True))
             if not label:
                 continue
             panel = _panel_from_tablink(a)
@@ -168,18 +158,24 @@ def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
             target_panel = panel
             break
     if not target_panel:
+        # Fallback: suche eine Tabelle mit Label "Kaufpreis"
+        for tbl in soup.select("table"):
+            if "kaufpreis" in tbl.get_text(" ", strip=True).lower():
+                target_panel = tbl
+                break
+    if not target_panel:
         return ""
+
     keys = ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")
-    for tr in target_panel.select("table tr"):
+    for tr in target_panel.select("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2:
             if any(k in cells[0].lower() for k in keys):
                 got = clean_price_string(cells[1])
                 if got: return got
-    for dt in target_panel.select("dl dt"):
+    for dt in target_panel.select("dt"):
         dd = dt.find_next_sibling("dd")
-        label = (dt.get_text(" ", strip=True) or "").lower()
-        if any(k in label for k in keys):
+        if any(k in (dt.get_text(" ", strip=True) or "").lower() for k in keys):
             got = clean_price_string(dd.get_text(" ", strip=True) if dd else "")
             if got: return got
     for li in target_panel.select("li"):
@@ -254,28 +250,18 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
         return clean_price_string(best)
     return ""
 
-# ---------------------------------------------------------------------------
-# Beschreibung aus allen 5 Tabs ziehen
-# ---------------------------------------------------------------------------
-def _is_stop_node(node):
-    cls = " ".join(node.get("class", []))
-    if any(k in cls for k in ("contact", "form", "sidebar", "widget")):
-        return True
-    txt = node.get_text(" ", strip=True) if hasattr(node, "get_text") else ""
-    return any(stop in txt for stop in STOP_STRINGS)
-
+# -------------------- Beschreibung aus Tabs/Boxen --------------------
 def _harvest_panel(panel):
     lines = []
     for p in panel.select("p"):
-        t = _normalize_spaces(p.get_text(" ", strip=True))
+        t = _norm(p.get_text(" ", strip=True))
         if t and not any(stop in t for stop in STOP_STRINGS):
             lines.append(t)
     for li in panel.select("ul li, ol li"):
-        t = _normalize_spaces(li.get_text(" ", strip=True))
-        if t:
-            lines.append(f"• {t}")
+        t = _norm(li.get_text(" ", strip=True))
+        if t: lines.append(f"• {t}")
     for tr in panel.select("table tr"):
-        cells = [_normalize_spaces(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
+        cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2:
             if cells[0] or cells[1]:
                 lines.append(f"- {cells[0]}: {cells[1]}")
@@ -283,39 +269,85 @@ def _harvest_panel(panel):
             lines.append(" ".join(cells))
     for dt in panel.select("dl dt"):
         dd = dt.find_next_sibling("dd")
-        k = _normalize_spaces(dt.get_text(" ", strip=True))
-        v = _normalize_spaces(dd.get_text(" ", strip=True)) if dd else ""
-        if k or v:
-            lines.append(f"- {k}: {v}".strip(" -:"))
+        k = _norm(dt.get_text(" ", strip=True))
+        v = _norm(dd.get_text(" ", strip=True)) if dd else ""
+        if k or v: lines.append(f"- {k}: {v}".strip(" -:"))
     out, seen = [], set()
     for ln in lines:
         if ln and ln not in seen:
             out.append(ln); seen.add(ln)
-        if len(out) >= 200:
+        if len(out) >= 200: break
+    return out
+
+def _collect_tabbed_sections(soup):
+    parts = []
+    tab_pairs = _find_tab_navs(soup)  # [(label, panel), ...]
+    if not tab_pairs:
+        return parts
+    for nice_name, aliases in TAB_LABELS.items():
+        for label, panel in tab_pairs:
+            if any(alias.lower() in label.lower() for alias in aliases):
+                lines = _harvest_panel(panel)
+                if lines:
+                    parts.append(f"{nice_name}:\n" + "\n".join(lines))
+                break
+    return parts
+
+def _find_box_heading(soup, text_candidates):
+    for el in soup.find_all(True, string=True):
+        txt = _norm(el.get_text(" ", strip=True))
+        if txt and any(txt.lower() == cand.lower() for cand in text_candidates):
+            return el
+    return None
+
+def _collect_box_after_heading(start_el):
+    if not start_el:
+        return []
+    lines = []
+    # gehe durch die nächsten Geschwister und sammle Content bis zur nächsten „großen“ Box/Heading
+    for sib in start_el.parent.find_all_next():
+        # Stop-Kriterien
+        if sib == start_el: 
+            continue
+        if sib.name in ("h2","h3","h4"): 
             break
+        if sib.has_attr("class") and any(k in " ".join(sib.get("class")) for k in ("kt-tabs", "elementor-tabs", "sidebar", "widget")):
+            break
+        # harvest
+        lines.extend(_harvest_panel(sib))
+        # harte Begrenzung
+        if len(lines) >= 200: 
+            break
+    # Dedupe
+    out, seen = [], set()
+    for ln in lines:
+        if ln and ln not in seen:
+            out.append(ln); seen.add(ln)
     return out
 
 def extract_description(soup: BeautifulSoup) -> str:
     """
-    Baut die Beschreibung aus *allen* 5 MSI-Kacheln (Tabs):
-    Beschreibung, Objektangaben, Ausstattung, Lage, Energieausweis.
+    Baut die Beschreibung aus *allen* 5 Bereichen:
+    - Tabs (Kadence/Elementor): Beschreibung, Objektangaben, Ausstattung, Lage, Energieausweis
+    - Fallback: Boxen mit denselben Überschriften
+    - Weitere Fallbacks: Content-Container, Meta/OG, Featureliste, <p> nach H1
     """
-    parts = []
-    tab_pairs = _find_tab_navs(soup)  # [(label, panel), ...]
-    if tab_pairs:
+    parts = _collect_tabbed_sections(soup)
+
+    # Falls keine Tabs erkannt wurden, versuche Boxen mit Überschrift-Text
+    if not parts:
         for nice_name, aliases in TAB_LABELS.items():
-            for label, panel in tab_pairs:
-                if any(alias.lower() in label.lower() for alias in aliases):
-                    lines = _harvest_panel(panel)
-                    if lines:
-                        parts.append(f"{nice_name}:\n" + "\n".join(lines))
-                    break
+            el = _find_box_heading(soup, aliases)
+            if el:
+                lines = _collect_box_after_heading(el)
+                if lines:
+                    parts.append(f"{nice_name}:\n" + "\n".join(lines))
+
     if parts:
         return ("\n\n".join(parts).strip())[:6000]
 
-    # Fallbacks, wenn keine Tabs erkennbar:
-    candidates = soup.select(".entry-content, article, .content, .post-content, .single-content, [class*='content'], [class*='text']")
-    for c in candidates:
+    # Fallbacks:
+    for c in soup.select(".entry-content, article, .content, .post-content, .single-content, [class*='content'], [class*='text']"):
         ps = [p.get_text(" ", strip=True) for p in c.select("p")]
         ps = [p for p in ps if p and not any(stop in p for stop in STOP_STRINGS)]
         if ps:
@@ -330,10 +362,9 @@ def extract_description(soup: BeautifulSoup) -> str:
         c = md["content"].strip()
         if c: return c
 
-    # Feature-Fallback
     features = []
     for li in soup.select("li"):
-        t = _normalize_spaces(li.get_text(" ", strip=True))
+        t = _norm(li.get_text(" ", strip=True))
         if not t: continue
         if re.search(r"\b(zimmer|schlafzimmer|badezimmer|wohnfl|wohnfläche|grundstück|nutzfl|balkon|terrasse|garage|stellplatz|baujahr|energie)\b", t, re.I):
             if not any(stop in t for stop in STOP_STRINGS):
@@ -342,13 +373,12 @@ def extract_description(soup: BeautifulSoup) -> str:
     if features:
         return " • ".join(features[:20])
 
-    # letzte Rettung: <p> nach H1
     h1 = soup.select_one("h1")
     if h1:
         ps = []
         for sib in h1.find_all_next():
             if sib.name == "p":
-                t = _normalize_spaces(sib.get_text(" ", strip=True))
+                t = _norm(sib.get_text(" ", strip=True))
                 if t and not any(stop in t for stop in STOP_STRINGS):
                     ps.append(t)
                 if len(ps) >= 8: break
@@ -383,7 +413,7 @@ def parse_detail(detail_url: str, mode: str):
     m_obj = RE_OBJEKTNR.search(page_text)
     objektnummer = m_obj.group(1).strip() if m_obj else ""
 
-    # Preis
+    # Preis (als String „123.456 €“)
     preis_value = extract_price(soup, page_text)
 
     # Ort
@@ -587,15 +617,19 @@ def parse_price_to_number(label: str):
         return None
 
 def make_record(row, unterkat):
+    # Preis als Number (Euro) -> vom Nutzer gewünscht: *100 (z. B. cents/Skalierung)
+    base_num = parse_price_to_number(row["Preis"])
+    preis_scaled = int(round(base_num * 100)) if base_num is not None else None
+
     return {
         "Titel":           row["Titel"],
-        "Kategorie":       row["KategorieDetected"],   # „Kaufen“/„Mieten“
+        "Kategorie":       row["KategorieDetected"],
         "Unterkategorie":  unterkat,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
         "Beschreibung":    row["Description"],
         "Bild":            row["Bild_URL"],
-        "Preis":           parse_price_to_number(row["Preis"]),
+        "Preis":           preis_scaled,
         "Standort":        row["Ort"],
     }
 
@@ -647,9 +681,9 @@ def sync_category(scraped_rows, category_label: str):
 def run(mode: str):
     """
     Modi:
-      - 'kauf'  : nur Kaufen-Sätze schreiben/syncen
-      - 'miete' : nur Mieten-Sätze schreiben/syncen
-      - 'auto'  : beide erkennen; zwei CSVs; zwei Upserts
+      - 'kauf'  : nur Kaufen-Sätze
+      - 'miete' : nur Mieten-Sätze
+      - 'auto'  : beide erkennen; zwei CSVs & Upserts
     """
     assert mode in ("kauf", "miete", "auto"), "Mode muss 'kauf', 'miete' oder 'auto' sein."
     csv_kauf  = "msi_kauf.csv"
