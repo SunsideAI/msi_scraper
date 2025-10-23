@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 import sys, time, csv, os, json, requests, re
 from urllib.parse import quote, urljoin
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 # ---------------------------------------------------------------------------
 # Konfiguration / ENV
@@ -16,9 +16,9 @@ USE_GPT_CLASSIFY = True
 # Airtable
 AIRTABLE_TOKEN    = os.getenv("AIRTABLE_TOKEN", "").strip()
 AIRTABLE_BASE     = os.getenv("AIRTABLE_BASE",  "").strip()
-AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()   # optional (Name)
-AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip()# bevorzugt (tbl...)
-AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()    # optional
+AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()    # optional (Name)
+AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip() # bevorzugt (tbl...)
+AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()     # optional
 
 # OpenAI (optional)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -63,7 +63,8 @@ RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Z
 RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
 RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
-STOP_STRINGS = ("Ihre Anfrage", "Kontakt", "Exposé anfordern", "Neueste Immobilien")
+# Stoppwörter im Content
+STOP_STRINGS = ("Ihre Anfrage", "Kontakt", "Exposé anfordern", "Neueste Immobilien", "Teilen auf")
 
 TAB_LABELS = {
     "Beschreibung":   ("beschreibung",),
@@ -310,102 +311,81 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     return ""
 
 # -------------------- Beschreibung (Vuetify + Fallbacks) --------------------
-def _harvest_panel(panel):
-    lines = []
-    for p in panel.select("p"):
-        t = _norm(p.get_text(" ", strip=True))
+def _harvest_block(el: Tag, lines: list):
+    if el.name == "p":
+        t = _norm(el.get_text(" ", strip=True))
         if t and not any(stop in t for stop in STOP_STRINGS):
             lines.append(t)
-    for li in panel.select("ul li, ol li"):
-        t = _norm(li.get_text(" ", strip=True))
-        if t: lines.append(f"• {t}")
-    for tr in panel.select("table tr"):
-        cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
-        if len(cells) >= 2:
-            if cells[0] or cells[1]:
+    elif el.name in ("ul", "ol"):
+        for li in el.select("li"):
+            t = _norm(li.get_text(" ", strip=True))
+            if t: lines.append(f"• {t}")
+    elif el.name == "table":
+        for tr in el.select("tr"):
+            cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
+            if len(cells) >= 2:
                 lines.append(f"- {cells[0]}: {cells[1]}")
-        elif cells:
-            lines.append(" ".join(cells))
-    for dt in panel.select("dl dt"):
-        dd = dt.find_next_sibling("dd")
-        k = _norm(dt.get_text(" ", strip=True))
-        v = _norm(dd.get_text(" ", strip=True)) if dd else ""
-        if k or v: lines.append(f"- {k}: {v}".strip(" -:"))
-    out, seen = [], set()
-    for ln in lines:
-        if ln and ln not in seen:
-            out.append(ln); seen.add(ln)
-        if len(out) >= 200: break
-    return out
+            elif cells:
+                lines.append(" ".join(cells))
+    elif el.name == "dl":
+        for dt in el.select("dt"):
+            dd = dt.find_next_sibling("dd")
+            k = _norm(dt.get_text(" ", strip=True))
+            v = _norm(dd.get_text(" ", strip=True)) if dd else ""
+            if k or v:
+                lines.append(f"- {k}: {v}".strip(" -:"))
 
-def _gather_until_next_heading(start_node):
-    """Sammelt Text ab start_node bis zur nächsten <p class='h4'>."""
-    lines = []
-    for sib in start_node.find_all_next():
-        if sib is start_node:
-            continue
-        if sib.name == "p" and "h4" in sib.get("class", []):
-            break
-        # sammeln
-        if sib.name == "p":
-            t = _norm(sib.get_text(" ", strip=True))
-            if t and not any(stop in t for stop in STOP_STRINGS):
-                lines.append(t)
-        if sib.name in ("ul", "ol"):
-            for li in sib.select("li"):
-                t = _norm(li.get_text(" ", strip=True))
-                if t:
-                    lines.append(f"• {t}")
-        if sib.name == "table":
-            for tr in sib.select("tr"):
-                cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
-                if len(cells) >= 2:
-                    lines.append(f"- {cells[0]}: {cells[1]}")
-                elif cells:
-                    lines.append(" ".join(cells))
-        if sib.name == "dl":
-            for dt in sib.select("dt"):
-                dd = dt.find_next_sibling("dd")
-                k = _norm(dt.get_text(" ", strip=True))
-                v = _norm(dd.get_text(" ", strip=True)) if dd else ""
-                if k or v:
-                    lines.append(f"- {k}: {v}".strip(" -:"))
-        if len(lines) >= 200:
-            break
-    # Dedupe
-    out, seen = [], set()
-    for ln in lines:
-        if ln and ln not in seen:
-            out.append(ln); seen.add(ln)
-    return out
-
-def _collect_vuetify_sections(soup):
-    """Liest Bereiche aus .v-card__text mit <p class='h4'>Überschriften (MSI/Vuetify)."""
+def _collect_vuetify_sections(soup: BeautifulSoup):
+    """
+    Liest Bereiche aus .v-card__text mit <p class='h4'>Überschriften (MSI/Vuetify).
+    Sammelt NUR innerhalb desselben Containers die folgenden Blöcke bis zum nächsten <p.h4>.
+    """
     parts = []
     for box in soup.select(".v-card__text"):
-        for h in box.select("p.h4"):
-            head = _norm(h.get_text(" ", strip=True))
-            key_lower = head.lower()
+        # Direkt-Kinder-Überschriften bevorzugen; sonst alle h4 darunter
+        headers = box.select("> p.h4") or box.select("p.h4")
+        for h in headers:
+            title_text = _norm(h.get_text(" ", strip=True))
+            key_lower = title_text.lower()
             match_name = None
             for nice, aliases in TAB_LABELS.items():
-                if any(key_lower == a for a in aliases) or key_lower == nice.lower():
+                if key_lower == nice.lower() or any(key_lower == a for a in aliases):
                     match_name = nice
                     break
             if not match_name:
                 continue
-            lines = _gather_until_next_heading(h)
+
+            # Geschwister im selben Container ablaufen
+            lines = []
+            node = h.next_sibling
+            while node:
+                if isinstance(node, NavigableString):
+                    node = node.next_sibling
+                    continue
+                if not isinstance(node, Tag):
+                    node = node.next_sibling
+                    continue
+                # Stop falls nächster Abschnitt oder Container-Verlassen
+                if node.name == "p" and "h4" in (node.get("class") or []):
+                    break
+                # Sicherstellen, dass node innerhalb des box-Containers liegt
+                if box not in node.parents and node is not box:
+                    break
+                # Sammeln
+                _harvest_block(node, lines)
+                # Safety: auf Kinder prüfen (falls Wrapper-Divs)
+                for child in node.find_all(recursive=False):
+                    if isinstance(child, Tag):
+                        _harvest_block(child, lines)
+                if len(lines) >= 200:
+                    break
+                node = node.next_sibling
+
             if lines:
                 parts.append(f"{match_name}:\n" + "\n".join(lines))
     return parts
 
-def _find_box_heading(soup, text_candidates):
-    for el in soup.find_all(True, string=True):
-        txt = _norm(el.get_text(" ", strip=True))
-        if txt and any(txt.lower() == cand for cand in text_candidates):
-            return el
-    return None
-
-def _collect_tabbed_sections(soup):
+def _collect_tabbed_sections(soup: BeautifulSoup):
     """Kadence/Elementor Tabs (Fallback)."""
     parts = []
     panels = soup.select('[role="tabpanel"], .kt-tabs-content-wrap > *')
@@ -434,7 +414,11 @@ def _collect_tabbed_sections(soup):
                 if any(a in preview for a in aliases):
                     txt_label = nice
                     break
-        lines = _harvest_panel(p)
+        lines = []
+        _harvest_block(p, lines)
+        for child in p.find_all(recursive=True):
+            if isinstance(child, Tag):
+                _harvest_block(child, lines)
         if lines and txt_label:
             label_map.setdefault(txt_label, []).extend(lines)
     if label_map:
