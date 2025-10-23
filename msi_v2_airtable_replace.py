@@ -677,9 +677,9 @@ def airtable_list_all():
 # Felder/Keys
 # ---------------------------------------------------------------------------
 def make_record(row, unterkat):
-    # Preis als Number (Euro) -> gewünscht: ×100 (z. B. Cent)
+    # Preis als Euro (ohne ×100)
     base_num = parse_price_to_number(row["Preis"])
-    preis_scaled = int(round(base_num * 100)) if base_num is not None else None
+    preis_value = float(base_num) if base_num is not None else None
 
     return {
         "Titel":           row["Titel"],
