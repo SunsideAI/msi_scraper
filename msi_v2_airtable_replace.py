@@ -62,7 +62,7 @@ RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Z
 RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
 RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
-# Wichtige Stop-Phrasen (Footer etc.)
+# klare Stop-Phrasen (Footer/CTA etc.)
 STOP_STRINGS = (
     "Ihre Anfrage", "Exposé anfordern", "Neueste Immobilien", "Teilen auf",
     "Datenschutz", "Impressum", "designed by wavepoint"
@@ -312,7 +312,7 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
         return clean_price_string(best)
     return ""
 
-# -------------------- Beschreibung (robust für MSI/Vuetify) --------------------
+# -------------------- Beschreibung (robust & scoped für MSI/Vuetify) --------------------
 
 SECTION_ALIASES = {
     "beschreibung": {"beschreibung"},
@@ -334,11 +334,15 @@ def _clean_lines(lines):
             out.append(t); seen.add(t)
     return out
 
-def _find_expose_container(soup: BeautifulSoup) -> Tag | None:
+def _find_expose_container(soup: BeautifulSoup) -> Tag:
     """
     Begrenzt die Suche auf den eigentlichen Exposé-Bereich (Vuetify).
     """
     cand = soup.select_one(".v-expose")
+    if cand:
+        return cand
+    # Falls .sw-vframe genutzt wird
+    cand = soup.select_one(".sw-vframe .v-expose")
     if cand:
         return cand
     for sel in [
@@ -358,15 +362,18 @@ def _collect_until_next_h4(start: Tag, scope: Tag) -> list[str]:
         if isinstance(node, Tag) and node is scope:
             break
         if isinstance(node, Tag):
-            # Abschnitt beendet?
+            # Abschnitt beendet, wenn nächste h4
             if node.name == "p" and "h4" in (node.get("class") or []):
                 break
+            # p-Absätze
             if node.name == "p":
                 txt = _norm(node.get_text(" ", strip=True))
                 if txt: lines.append(txt)
+            # Listen
             for li in node.select("ul li, ol li"):
                 t = _norm(li.get_text(" ", strip=True))
                 if t: lines.append(f"• {t}")
+            # Tabellen & DL
             for tr in node.select("table tr"):
                 cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
                 if len(cells) >= 2: lines.append(f"- {cells[0]}: {cells[1]}")
@@ -387,12 +394,12 @@ def extract_description(soup: BeautifulSoup) -> str:
     Liest die MSI-Tabs:
       - nur im Exposé-Container
       - <p class="h4">-Abschnitte + nachfolgende Inhalte bis zur nächsten h4
-      - sauberes Zusammenführen zu einem Feld
+      - Zusammenführen zu EINEM Feld (inkl. Ausstattung/Lage/Energieausweis/Objektangaben)
     """
     scope = _find_expose_container(soup)
     sections = []
 
-    # 1) bevorzugt: strukturierte Kacheln
+    # 1) bevorzugt: strukturierte Kacheln im scope
     for box in scope.select(".v-card__text"):
         head = box.select_one("p.h4")
         if not head:
@@ -583,7 +590,12 @@ def airtable_existing_fields():
     return set()
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
-    out = {k: v for k, v in record.items() if (not allowed_fields or k in allowed_fields)}
+    """
+    WICHTIG: Nicht anhand 'allowed_fields' filtern – Airtable liefert kein festes Schema
+    über die API. Sonst würden Felder wie 'Beschreibung' droppen, wenn sie in der ersten
+    gelesenen Zeile fehlen. Wir senden einfach alle Keys (bis auf leeren Preis).
+    """
+    out = dict(record)
     if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
         out.pop("Preis", None)
     return out
@@ -651,7 +663,7 @@ def make_record(row, unterkat):
         "Unterkategorie":  unterkat,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
-        "Beschreibung":    row["Description"],   # jetzt gefüllt
+        "Beschreibung":    row["Description"],   # jetzt zuverlässig gefüllt
         "Bild":            row["Bild_URL"],
         "Preis":           preis_value,
         "Standort":        row["Ort"],
@@ -668,8 +680,8 @@ def unique_key(fields: dict) -> str:
 # Upsert je Kategorie
 # ---------------------------------------------------------------------------
 def sync_category(scraped_rows, category_label: str):
-    allowed = airtable_existing_fields()
-    print(f"[Airtable] Erkannte Felder: {sorted(list(allowed)) or '(keine – Tabelle evtl. leer)'}")
+    allowed = airtable_existing_fields()  # behalten für Logging/Info
+    print(f"[Airtable] Erkannte Beispiel-Felder: {sorted(list(allowed)) or '(keine – Tabelle evtl. leer)'}")
 
     all_ids, all_fields = airtable_list_all()
     existing = {}
@@ -740,6 +752,7 @@ def run(mode: str):
                 unterkat = decide_subcategory(row)
                 record = make_record(row, unterkat)
                 all_rows.append(record)
+
                 print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
                 time.sleep(0.15)
             except Exception as e:
