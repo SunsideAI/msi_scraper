@@ -63,7 +63,8 @@ RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
 RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
 # keine aggressive Stops mehr (damit Absätze mit „Kontaktieren…“ erhalten bleiben)
-STOP_STRINGS = ("Ihre Anfrage", "Exposé anfordern", "Neueste Immobilien", "Teilen auf")
+STOP_STRINGS = ("Ihre Anfrage", "Exposé anfordern", "Neueste Immobilien", "Teilen auf",
+                "Datenschutz", "Impressum")
 
 TAB_LABELS = {
     "Beschreibung":   ("beschreibung",),
@@ -309,87 +310,123 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
         return clean_price_string(best)
     return ""
 
-# -------------------- Beschreibung (fokussiert auf MSI/Vuetify) --------------------
-def _collect_section_text_by_container(soup: BeautifulSoup, heading_texts):
-    """
-    Sucht Container .v-card__text, der ein <p class="h4"> mit passendem Titel enthält
-    und gibt alle p:not(.h4), ul/ol, table, dl innerhalb dieses Containers zurück.
-    """
-    out = []
-    for box in soup.select(".v-card__text"):
-        h = box.select_one("p.h4")
-        if not h:
-            continue
-        head = _norm(h.get_text(" ", strip=True)).lower()
-        if head not in heading_texts:
-            continue
+# -------------------- Beschreibung (robust für MSI/Vuetify) --------------------
 
-        # Alle <p> außer der Überschrift
-        for p in box.select("p"):
-            if "h4" in (p.get("class") or []):
-                continue
-            t = _norm(p.get_text(" ", strip=True))
-            if t and not any(stop.lower() in t.lower() for stop in STOP_STRINGS):
-                out.append(t)
+SECTION_ALIASES = {
+    "beschreibung": {"beschreibung"},
+    "objektangaben": {"objektangaben","objektdaten","daten"},
+    "ausstattung": {"ausstattung","merkmale"},
+    "lage": {"lage","lagebeschreibung","umfeld"},
+    "energieausweis": {"energieausweis","energie","energiekennwerte"},
+}
 
-        # Listenpunkte
-        for li in box.select("ul li, ol li"):
-            t = _norm(li.get_text(" ", strip=True))
+def _clean_lines(lines):
+    out, seen = [], set()
+    for t in lines:
+        if not t: 
+            continue
+        # Stop-Wörter entfernen
+        if any(s.lower() in t.lower() for s in STOP_STRINGS):
+            continue
+        t = _norm(t)
+        if t and t not in seen:
+            out.append(t); seen.add(t)
+    return out
+
+def _collect_following_until_next_h4(header_p: Tag) -> list[str]:
+    """Sammelt Texte (p, li, table/dl) nach einem <p class='h4'> bis zur nächsten <p class='h4'>."""
+    lines = []
+    for sib in header_p.next_siblings:
+        if isinstance(sib, Tag) and "h4" in (sib.get("class") or []):
+            break  # nächster Abschnitt beginnt
+        if isinstance(sib, Tag):
+            # Absätze
+            if sib.name == "p":
+                txt = _norm(sib.get_text(" ", strip=True))
+                if txt:
+                    lines.append(txt)
+            # Listen
+            for li in sib.select("ul li, ol li"):
+                t = _norm(li.get_text(" ", strip=True))
+                if t: lines.append(f"• {t}")
+            # Tabellen & DL
+            for tr in sib.select("table tr"):
+                cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
+                if len(cells) >= 2:
+                    lines.append(f"- {cells[0]}: {cells[1]}")
+                elif cells:
+                    lines.append(" ".join(cells))
+            for dt in sib.select("dl dt"):
+                dd = dt.find_next_sibling("dd")
+                k = _norm(dt.get_text(" ", strip=True))
+                v = _norm(dd.get_text(" ", strip=True)) if dd else ""
+                if k or v:
+                    lines.append(f"- {k}: {v}".strip(" -:"))
+        elif isinstance(sib, NavigableString):
+            t = _norm(str(sib))
             if t:
-                out.append(f"• {t}")
-
-        # Tabellen / DL
-        for tr in box.select("table tr"):
-            cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
-            if len(cells) >= 2:
-                out.append(f"- {cells[0]}: {cells[1]}")
-            elif cells:
-                out.append(" ".join(cells))
-        for dt in box.select("dl dt"):
-            dd = dt.find_next_sibling("dd")
-            k = _norm(dt.get_text(" ", strip=True))
-            v = _norm(dd.get_text(" ", strip=True)) if dd else ""
-            if k or v:
-                out.append(f"- {k}: {v}".strip(" -:"))
-
-    # de-dupe
-    seen, result = set(), []
-    for line in out:
-        if line and line not in seen:
-            result.append(line); seen.add(line)
-    return result
+                lines.append(t)
+    return _clean_lines(lines)
 
 def extract_description(soup: BeautifulSoup) -> str:
     """
-    Holt Inhalte aus den MSI-Kacheln:
-      - Beschreibung
-      - Objektangaben
-      - Ausstattung
-      - Lage
-      - Energieausweis
-    jeweils aus .v-card__text-Containern mit <p.h4> als Überschrift.
+    Holt Inhalte aus MSI-Detailseiten (Vuetify):
+      - Erster Versuch: Container .v-card__text mit <p.h4> Überschrift.
+      - Zweiter Versuch: überall im DOM <p.h4> Abschnitte sequenziell auslesen.
+      - Fallbacks: generische Content-Bereiche & Meta-Description.
+    Ergebnis: Ein einziges Feld mit Abschnittstiteln + Inhalten.
     """
-    sections_order = [
-        ("Beschreibung",   {"beschreibung"}),
-        ("Objektangaben",  {"objektangaben", "objektdaten", "daten"}),
-        ("Ausstattung",    {"ausstattung", "merkmale"}),
-        ("Lage",           {"lage", "lagebeschreibung", "umfeld"}),
-        ("Energieausweis", {"energieausweis", "energie", "energiekennwerte"}),
-    ]
+    collected_sections = []
 
-    parts = []
-    for label, keys in sections_order:
-        lines = _collect_section_text_by_container(soup, keys)
-        if lines:
-            parts.append(f"{label}:\n" + "\n".join(lines))
+    # 1) MSI/Vuetify Standard: .v-card__text Container
+    for box in soup.select(".v-card__text"):
+        head = box.select_one("p.h4")
+        if not head: 
+            continue
+        title = _norm(head.get_text(" ", strip=True)).lower()
+        # Aliase prüfen
+        for sect_name, aliases in SECTION_ALIASES.items():
+            if title in aliases:
+                lines = _collect_following_until_next_h4(head)
+                if lines:
+                    collected_sections.append((sect_name.capitalize(), lines))
+                break
 
-    if parts:
+    # 2) Falls nichts gefunden: überall im DOM die <p class="h4">-Überschriften linear parsen
+    if not collected_sections:
+        for p in soup.find_all("p", class_="h4"):
+            title = _norm(p.get_text(" ", strip=True)).lower()
+            for sect_name, aliases in SECTION_ALIASES.items():
+                if title in aliases:
+                    lines = _collect_following_until_next_h4(p)
+                    if lines:
+                        collected_sections.append((sect_name.capitalize(), lines))
+                    break
+
+    # 3) Zusätzlicher Versuch: Vuetify v-window-item Panels (falls Struktur abweicht)
+    if not collected_sections:
+        for item in soup.select(".v-window-item"):
+            head = item.select_one("p.h4")
+            if not head: 
+                continue
+            title = _norm(head.get_text(" ", strip=True)).lower()
+            for sect_name, aliases in SECTION_ALIASES.items():
+                if title in aliases:
+                    lines = _collect_following_until_next_h4(head)
+                    if lines:
+                        collected_sections.append((sect_name.capitalize(), lines))
+                    break
+
+    # 4) Generische Fallbacks
+    if collected_sections:
+        parts = []
+        for title, lines in collected_sections:
+            parts.append(f"{title}:\n" + "\n".join(lines))
         return ("\n\n".join(parts).strip())[:6000]
 
-    # Fallbacks (falls MSI-Struktur nicht greift)
     for c in soup.select(".entry-content, article, .content, .post-content, .single-content, [class*='content'], [class*='text']"):
         ps = [p.get_text(" ", strip=True) for p in c.select("p")]
-        ps = [p for p in ps if p and not any(stop in p for stop in STOP_STRINGS)]
+        ps = _clean_lines(ps)
         if ps:
             return "\n\n".join(ps[:12]).strip()
 
@@ -450,7 +487,7 @@ def parse_detail(detail_url: str, mode: str):
     return {
         "Titel":        title,
         "URL":          detail_url,
-        "Description":  description,
+        "Description":  description,   # <— jetzt zuverlässig gefüllt
         "Objektnummer": objektnummer,
         "Preis":        preis_value,
         "Ort":          ort,
@@ -617,7 +654,7 @@ def make_record(row, unterkat):
         "Unterkategorie":  unterkat,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
-        "Beschreibung":    row["Description"],
+        "Beschreibung":    row["Description"],   # <— jetzt gefüllt
         "Bild":            row["Bild_URL"],
         "Preis":           preis_value,
         "Standort":        row["Ort"],
