@@ -61,16 +61,14 @@ RE_PLZ_ORT_STRICT = re.compile(
     r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß\-\s]+?)\b(?![A-Za-zÄÖÜäöüß])"
 )
 RE_KAUF = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
-RE_MIETE = re.compile(
-    r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE
-)
+RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
-# Footer/CTA/Contact-Filter
+# Footer/CTA/Contact-Filter (aus Beschreibung fernhalten)
 STOP_STRINGS = (
     "Ihre Anfrage", "Exposé anfordern", "Neueste Immobilien", "Teilen auf",
     "Datenschutz", "Impressum", "designed by wavepoint",
     "Ansprechpartner", "Kontaktieren Sie uns", "Zur Objektanfrage",
-    "Telefon", "E-Mail", "Email", "Details", "msi-hessen.de"
+    "msi-hessen.de"
 )
 
 TAB_LABELS = {
@@ -179,9 +177,9 @@ def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
                 break
     if not target_panel:
         return ""
-    keys = ("kaufpreis", "kaltmiete", "warmmiete", "nettokaltmiete", "miete", "preis")
+    keys = ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")
     for tr in target_panel.select("tr"):
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2 and any(k in cells[0].lower() for k in keys):
             got = clean_price_string(cells[1])
             if got:
@@ -333,21 +331,8 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     return ""
 
 # -------------------- BESCHREIBUNG – NUR TAB "BESCHREIBUNG" --------------------
-SECTION_ALIASES = {
-    "beschreibung": {"beschreibung"},
-    "objektangaben": {"objektangaben","objektdaten","daten"},
-    "ausstattung": {"ausstattung","merkmale"},
-    "lage": {"lage","lagebeschreibung","umfeld"},
-    "energieausweis": {"energieausweis","energie","energiekennwerte"},
-}
-
-# Filter für Telefonnummern, E-Mails, Teaserzeilen
-RE_PHONE = re.compile(r"\b(?:\+?\d{2,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{5,}\b")
+RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-RE_TEASER_LINE = re.compile(
-    r"^\s*(?:\d{5}\s+[A-ZÄÖÜ][\wÄÖÜäöüß/ -]+|Kaufpreis\s+\d[\d\.\u00A0\u202F\u2009,]*\s*€|Details)\s*$",
-    re.I,
-)
 
 def _clean_lines(lines):
     out, seen = [], set()
@@ -357,98 +342,73 @@ def _clean_lines(lines):
         t = _norm(t)
         if any(s.lower() in t.lower() for s in STOP_STRINGS):
             continue
-        if RE_PHONE.search(t) or RE_EMAIL.search(t) or RE_TEASER_LINE.match(t):
+        if RE_PHONE.search(t) or RE_EMAIL.search(t):
             continue
-        if t and t not in seen:
+        if t not in seen:
             out.append(t)
             seen.add(t)
     return out
 
-def _find_expose_container(soup: BeautifulSoup) -> Tag:
-    """Begrenzt die Suche auf den eigentlichen Exposé-Bereich (Vuetify)."""
-    cand = soup.select_one(".v-expose")
-    if cand:
-        return cand
-    cand = soup.select_one(".sw-vframe .v-expose")
-    if cand:
-        return cand
-    for sel in ['div[id*="expose"]', 'section[id*="expose"]',
-                '.immo-listing_infotext', '.expose', '.exposé']:
-        cand = soup.select_one(sel)
-        if cand:
-            return cand
-    return soup
-
-def _text_from_container(container: Tag) -> list[str]:
-    """Nimmt NUR Inhalte innerhalb des übergebenen Containers .v-card__text."""
-    lines = []
-    # direkte <p> (ohne Überschrift)
-    for p in container.select("> p"):
-        if "h4" in (p.get("class") or []):  # Überschrift selbst auslassen
-            continue
-        t = _norm(p.get_text(" ", strip=True))
-        if t:
-            lines.append(t)
-    # Listen
-    for li in container.select("ul li, ol li"):
-        t = _norm(li.get_text(" ", strip=True))
-        if t:
-            lines.append("• " + t)
-    # einfache Tabellen / DL (falls doch vorhanden)
-    for tr in container.select("table tr"):
-        cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
-        if len(cells) >= 2:
-            lines.append(f"- {cells[0]}: {cells[1]}")
-        elif cells:
-            lines.append(" ".join(cells))
-    for dt in container.select("dl dt"):
-        dd = dt.find_next_sibling("dd")
-        k = _norm(dt.get_text(" ", strip=True))
-        v = _norm(dd.get_text(" ", strip=True)) if dd else ""
-        if k or v:
-            lines.append(f"- {k}: {v}".strip(" -:"))
-    return lines
+def _find_expose_scope(soup: BeautifulSoup) -> Tag:
+    """
+    Begrenzt die Suche auf den eigentlichen Exposé-Bereich.
+    Bevorzugt: .sw-yframe .sw-vframe .v-expose -> ansonsten .v-expose -> ansonsten soup.
+    """
+    scope = soup.select_one(".sw-yframe .sw-vframe .v-expose")
+    if scope:
+        return scope
+    return soup.select_one(".v-expose") or soup
 
 def extract_description(soup: BeautifulSoup) -> str:
     """
-    NUR den Text aus dem Tab 'Beschreibung' zurückgeben.
-    Reihenfolge:
-      1) Aktives Tab-Panel .v-window-item.v-window-item--active (wenn dort 'Beschreibung'-Box existiert)
-      2) Panel mit id #tab-0
-      3) Erster .v-card__text mit Überschrift 'Beschreibung' im Exposé-Scope
-    Keine globalen Fallbacks – so vermeiden wir Fremdtexte sicher.
+    Greift ausschließlich auf den 'Beschreibung'-Tab zu:
+      scope (.v-expose/.sw-vframe) -> .v-tabs-items .v-window__container:
+        1) Panel #tab-0 (üblich 'Beschreibung')
+        2) aktives Panel .v-window-item--active
+      In jedem Panel: .v-card .v-card__text mit <p class="h4">Beschreibung</p> + folgende <p>-Absätze.
     """
-    scope = _find_expose_container(soup)
+    scope = _find_expose_scope(soup)
 
-    # 1) aktives Panel (meist 'Beschreibung' aktiv)
-    active = scope.select_one(".v-tabs-items .v-window__container .v-window-item.v-window-item--active")
-    if active:
-        for box in active.select(".v-card__text"):
-            head = box.select_one("p.h4")
-            if head and _norm(head.get_text(" ", strip=True)).lower() == "beschreibung":
-                lines = _clean_lines(_text_from_container(box))
-                if lines:
-                    return "\n".join(lines)[:6000]
+    # 1) Panel #tab-0 innerhalb des Scopes
+    panel = scope.select_one(".v-tabs-items .v-window__container #tab-0")
+    if not panel:
+        # 2) Fallback: aktives Panel
+        panel = scope.select_one(".v-tabs-items .v-window__container .v-window-item.v-window-item--active")
+    if not panel:
+        return ""
 
-    # 2) Panel #tab-0 (üblicherweise 'Beschreibung')
-    tab0 = scope.select_one("#tab-0")
-    if tab0:
-        for box in tab0.select(".v-card__text"):
-            head = box.select_one("p.h4")
-            if head and _norm(head.get_text(" ", strip=True)).lower() == "beschreibung":
-                lines = _clean_lines(_text_from_container(box))
-                if lines:
-                    return "\n".join(lines)[:6000]
+    # Erwartete Box mit Inhalt
+    box = panel.select_one(".v-card .v-card__text") or panel.select_one(".v-card__text")
+    if not box:
+        return ""
 
-    # 3) Fallback im Exposé-Scope
-    for box in scope.select(".v-card__text"):
-        head = box.select_one("p.h4")
-        if head and _norm(head.get_text(" ", strip=True)).lower() == "beschreibung":
-            lines = _clean_lines(_text_from_container(box))
-            if lines:
-                return "\n".join(lines)[:6000]
+    # Überschrift muss (wenn vorhanden) 'Beschreibung' sein
+    head = box.select_one("p.h4, h4")
+    if head:
+        heading = _norm(head.get_text(" ", strip=True)).lower()
+        if heading != "beschreibung":
+            # Falls #tab-0 ohne Head, brechen wir nicht ab – wir lesen dann die <p>-Inhalte
+            pass
 
-    return ""
+    # Sammle alle <p> im Box-Container außer der Headline
+    lines = []
+    for p in box.select("p"):
+        if p is head or ("h4" in (p.get("class") or [])):
+            continue
+        txt = _norm(p.get_text(" ", strip=True))
+        if txt:
+            lines.append(txt)
+
+    # Fallback: gesamter Box-Text ohne Überschrift
+    if not lines:
+        txt = _norm(box.get_text(" ", strip=True))
+        if head:
+            txt = txt.replace(_norm(head.get_text(" ", strip=True)), "").strip()
+        if txt:
+            lines.append(txt)
+
+    lines = _clean_lines(lines)
+    return ("\n".join(lines))[:6000]
 
 # ---------------------------------------------------------------------------
 # DETAIL-PARSER
@@ -508,7 +468,7 @@ def parse_detail(detail_url: str, mode: str):
     }
 
 # ---------------------------------------------------------------------------
-# AIRTABLE HELPER (vollständig: list, create, update, delete, sync)
+# AIRTABLE HELPER (vollständig)
 # ---------------------------------------------------------------------------
 def airtable_table_segment():
     if AIRTABLE_TABLE_ID:
@@ -544,9 +504,7 @@ def airtable_existing_fields():
     return set()
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set = None) -> dict:
-    """
-    NICHT anhand dynamischer 'allowed_fields' filtern – alle Keys senden (bis auf leeren Preis).
-    """
+    """Alle Keys senden (bis auf leeren Preis)."""
     out = dict(record)
     if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
         out.pop("Preis", None)
@@ -629,7 +587,7 @@ def make_record(row):
     }
 
 # ---------------------------------------------------------------------------
-# SYNC (create/update/delete) je Kategorie
+# SYNC je Kategorie
 # ---------------------------------------------------------------------------
 def sync_category(scraped_rows, category_label: str):
     allowed = airtable_existing_fields()
@@ -730,15 +688,11 @@ def run(mode="auto"):
     cols = ["Titel","Kategorie","Webseite","Objektnummer","Beschreibung","Bild","Preis","Standort"]
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            w.writerows(rows_kauf)
+            w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows_kauf)
         print(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
     if rows_miete:
         with open(csv_miete, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            w.writerows(rows_miete)
+            w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows_miete)
         print(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
 
     if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
