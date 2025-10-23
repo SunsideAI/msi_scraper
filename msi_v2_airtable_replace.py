@@ -7,7 +7,6 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 # Konfiguration / ENV
 # ---------------------------------------------------------------------------
-# Zielseite: https://www.msi-hessen.de/kaufen/immobilienangebote/
 BASE = "https://www.msi-hessen.de"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -34,38 +33,20 @@ def soup_get(url: str) -> BeautifulSoup:
 
 def get_list_page_urls(mode: str, max_pages: int = 50):
     """
-    Gleiche Signatur wie im Werneburg-Script.
-    MSI nutzt /page/{n} Paginierung. 'miete' wird sauber behandelt (keine Seiten).
+    MSI listet Kauf & Miete zusammen auf /kaufen/immobilienangebote/ und paginiert mit /page/{n}.
+    Wir verwenden für ALLE Modi diese Listing-Seite.
     """
-    urls = []
-    if mode == "kauf":
-        first = f"{BASE}/kaufen/immobilienangebote/"
-        pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
-        for page in range(1, max_pages + 1):
-            urls.append(first if page == 1 else pattern.format(n=page))
-    else:
-        # (optional) Wenn du später Mieten anbinden willst, hier anpassen:
-        # first = f"{BASE}/mieten/..." ; pattern = f"{BASE}/mieten/.../page/{{n}}/"
-        # Bis dahin liefern wir keine Seiten zurück.
-        pass
-    return urls
+    first = f"{BASE}/kaufen/immobilienangebote/"
+    pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
+    return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
 
 def collect_detail_links(list_url: str):
-    """
-    Gleiche API wie im Werneburg-Script.
-    MSI-Listen zeigen Detailseiten unter /angebote/... (z.B. /angebote/efh-xyz/)
-    """
     soup = soup_get(list_url)
     links = set()
-
     for a in soup.select('a[href*="/angebote/"]'):
         href = a.get("href")
-        if not href:
-            continue
-        if not href.startswith("http"):
-            href = urljoin(BASE, href)
-        links.add(href)
-
+        if href:
+            links.add(href if href.startswith("http") else urljoin(BASE, href))
     return list(links)
 
 # ---------------------------------------------------------------------------
@@ -74,51 +55,54 @@ def collect_detail_links(list_url: str):
 RE_PRICE_EUR = re.compile(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})?\s*€")
 RE_OBJEKTNR  = re.compile(r"Objekt[-\s]?Nr\.?:\s*([A-Za-z0-9\-_/]+)")
 RE_PLZ_ORT   = re.compile(r"\b([0-9]{5}\s+[A-Za-zÄÖÜäöüß\-\s]+)\b")
+RE_KAUF      = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
+RE_MIETE     = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
+
+def detect_category(page_text: str) -> str:
+    if RE_MIETE.search(page_text):
+        return "Mieten"
+    if RE_KAUF.search(page_text):
+        return "Kaufen"
+    # Heuristik: ohne Mietbegriffe → eher Kauf
+    return "Kaufen"
 
 def parse_detail(detail_url: str, mode: str):
-    """
-    Signatur identisch zum Werneburg-Parser (detail_url, mode) – 'mode' wird nicht benötigt,
-    ist aber für API-Gleichheit dabei.
-    """
     soup = soup_get(detail_url)
     page_text = soup.get_text("\n", strip=True)
 
-    # Titel: erstes <h1>
+    # Titel
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
-    # Beschreibung: erste sinnvollen Absätze nach H1 (Abbruch bei Formular/Sidebar)
+    # Beschreibung: erste sinnvollen Absätze nach H1
     description = ""
     if h1:
-        parts, count = [], 0
+        parts = []
         for sib in h1.find_all_next():
             if sib.name == "p":
                 t = sib.get_text(" ", strip=True)
                 if not t:
                     continue
-                # Stopper (Kontakt-/Formular-/Sidebartexte vermeiden)
                 if any(stop in t for stop in ("Ihre Anfrage", "Neueste Immobilien", "Kontakt", "Exposé anfordern")):
                     break
                 parts.append(t)
-                count += 1
-                if count >= 10:
+                if len(parts) >= 10:
                     break
         description = "\n\n".join(parts).strip()
 
-    # Objektnummer (z.B. "Objekt-Nr.: 4220")
+    # Objektnummer
     m_obj = RE_OBJEKTNR.search(page_text)
     objektnummer = m_obj.group(1).strip() if m_obj else ""
 
-    # Preis: erster Euro-Betrag
+    # Preis
     m_price = RE_PRICE_EUR.search(page_text)
     preis_value = m_price.group(0) if m_price else ""
 
-    # Ort: versuche PLZ + Ort aus Headline/Intro zu extrahieren
-    # Oft steht "… zum Kauf 34626 Neukirchen" bzw. im Body taucht die PLZ/Ort-Kombi einmal eindeutig auf.
+    # Ort (PLZ + Ort)
     m_ort = RE_PLZ_ORT.search(page_text)
     ort = m_ort.group(1).strip() if m_ort else ""
 
-    # Bild: bevorzugt Link zur externen Galerie (z.B. immo.screenwork.de), sonst erstes <img>
+    # Bild (externes Galerie-Link bevorzugt)
     image_url = ""
     a_img = soup.select_one('a[href*="immo."]') or soup.select_one('a[href*="screenwork"]')
     if a_img and a_img.has_attr("href"):
@@ -128,6 +112,9 @@ def parse_detail(detail_url: str, mode: str):
         if img and img.has_attr("src"):
             image_url = urljoin(BASE, img["src"])
 
+    # Kategorie aus Detailtext erkennen
+    kategorie_detected = detect_category(page_text)
+
     return {
         "Titel":        title,
         "URL":          detail_url,
@@ -136,6 +123,7 @@ def parse_detail(detail_url: str, mode: str):
         "Preis":        preis_value,
         "Ort":          ort,
         "Bild_URL":     image_url,
+        "KategorieDetected": kategorie_detected,
     }
 
 # ---------------------------------------------------------------------------
@@ -147,26 +135,13 @@ KEYS_GEWERBE    = ["gewerbe", "büro", "laden", "praxis", "lager", "halle", "gas
 KEYS_KAPITAL    = ["kapitalanlage", "rendite", "vermietet", "anlageobjekt", "investment"]
 KEYS_STELLPLATZ = ["stellplatz", "parkplatz", "tiefgarage", "garage", "carport"]
 
-def heuristic_subcategory(row, mode):
-    """
-    Gleiche API wie im Werneburg-Script.
-    Bei MSI scrapen wir aktuell 'kauf'; Logik bleibt identisch & robust.
-    """
+def heuristic_subcategory(row):
     text = f"{row.get('Titel','')} {row.get('Description','')}".lower()
-
-    if mode == "miete":
-        if any(k in text for k in KEYS_STELLPLATZ): return "Stellplatz"
-        if any(k in text for k in KEYS_GEWERBE):    return "Gewerbe"
-        if any(k in text for k in KEYS_HAUS):       return "Haus"
-        if any(k in text for k in KEYS_WOHNUNG):    return "Wohnung"
-        return "Wohnung"
-
-    # kauf
     score = {"Wohnung":0, "Haus":0, "Gewerbe":0, "Kapitalanlage":0}
-    for k in KEYS_WOHNUNG:    score["Wohnung"]       += text.count(k)
-    for k in KEYS_HAUS:       score["Haus"]          += text.count(k)
-    for k in KEYS_GEWERBE:    score["Gewerbe"]       += text.count(k)
-    for k in KEYS_KAPITAL:    score["Kapitalanlage"] += text.count(k)
+    for k in KEYS_WOHNUNG:  score["Wohnung"]       += text.count(k)
+    for k in KEYS_HAUS:     score["Haus"]          += text.count(k)
+    for k in KEYS_GEWERBE:  score["Gewerbe"]       += text.count(k)
+    for k in KEYS_KAPITAL:  score["Kapitalanlage"] += text.count(k)
 
     if score["Kapitalanlage"] >= 2: return "Kapitalanlage"
     if score["Gewerbe"] >= 2:       return "Gewerbe"
@@ -176,7 +151,7 @@ def heuristic_subcategory(row, mode):
     best = max(score, key=score.get)
     if score[best] >= 2 and list(score.values()).count(score[best]) == 1:
         return best
-    return "Haus"
+    return "Haus"  # pragmatischer Fallback
 
 def gpt_category(row):
     if not USE_GPT_CLASSIFY or not OPENAI_API_KEY:
@@ -193,8 +168,10 @@ def gpt_category(row):
         )
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":"Du bist ein präziser Immobilien-Klassifizierer."},
-                      {"role":"user","content": prompt}],
+            messages=[
+                {"role":"system","content":"Du bist ein präziser Immobilien-Klassifizierer."},
+                {"role":"user","content": prompt}
+            ],
             temperature=0
         )
         out = (resp.choices[0].message.content or "").strip().lower()
@@ -204,18 +181,15 @@ def gpt_category(row):
         print(f"[GPT] Fehler: {e}")
         return ""
 
-def decide_subcategory(row, mode):
-    sub = heuristic_subcategory(row, mode)
-    if sub:
-        return sub
-    if mode == "kauf":
-        g = gpt_category(row)
-        if g in {"Wohnung","Haus","Gewerbe","Kapitalanlage"}:
-            return g
-    return "Wohnung" if mode == "miete" else "Haus"
+def decide_subcategory(row):
+    sub = heuristic_subcategory(row)
+    if sub: return sub
+    g = gpt_category(row)
+    if g in {"Wohnung","Haus","Gewerbe","Kapitalanlage"}: return g
+    return "Haus"
 
 # ---------------------------------------------------------------------------
-# Airtable API – Helpers (unverändert)
+# Airtable API – Helpers
 # ---------------------------------------------------------------------------
 def airtable_table_segment():
     if AIRTABLE_TABLE_ID:
@@ -314,7 +288,6 @@ def parse_price_to_number(label: str):
     if not label:
         return None
     cleaned = re.sub(r"[^\d,\.]", "", label)
-    # EU-Format → Komma als Dezimaltrenner, Punkte tausend
     if "," in cleaned and "." in cleaned:
         cleaned = cleaned.replace(".", "").replace(",", ".")
     elif "," in cleaned and "." not in cleaned:
@@ -324,11 +297,11 @@ def parse_price_to_number(label: str):
     except Exception:
         return None
 
-def make_record(row, kategorie_main, unterkat):
+def make_record(row, unterkat):
     return {
         "Titel":           row["Titel"],
-        "Kategorie":       kategorie_main,       # Kaufen/Mieten
-        "Unterkategorie":  unterkat,             # Wohnung/Haus/Gewerbe/Stellplatz; Kapitalanlage
+        "Kategorie":       row["KategorieDetected"],   # Wichtig: aus Detail erkannt
+        "Unterkategorie":  unterkat,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
         "Beschreibung":    row["Description"],
@@ -347,7 +320,7 @@ def unique_key(fields: dict) -> str:
     return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
 
 # ---------------------------------------------------------------------------
-# Allgemeine Sync-Logik (Upsert) je Kategorie – unverändert
+# Sync-Logik
 # ---------------------------------------------------------------------------
 def sync_category(scraped_rows, category_label: str):
     allowed = airtable_existing_fields()
@@ -386,66 +359,77 @@ def sync_category(scraped_rows, category_label: str):
 # ---------------------------------------------------------------------------
 def run(mode: str):
     """
-    API identisch zu Werneburg: run(mode) mit 'kauf' oder 'miete'.
-    Für MSI ist aktuell nur 'kauf' hinterlegt – 'miete' würde 0 Seiten liefern.
+    Modi:
+      - 'kauf'  : nur Kaufen-Sätze schreiben/syncen
+      - 'miete' : nur Mieten-Sätze schreiben/syncen
+      - 'auto'  : beides erkennen; zwei CSVs; zwei Upserts
     """
-    assert mode in ("kauf", "miete"), "Mode muss 'kauf' oder 'miete' sein."
-    kategorie_main = "Kaufen" if mode == "kauf" else "Mieten"
-    csv_name = f"msi_{mode}.csv"
+    assert mode in ("kauf", "miete", "auto"), "Mode muss 'kauf', 'miete' oder 'auto' sein."
+    csv_kauf  = "msi_kauf.csv"
+    csv_miete = "msi_miete.csv"
 
     all_rows, seen = [], set()
-    pages = get_list_page_urls(mode)
-    if not pages:
-        print(f"[INFO] Keine Listen-Seiten für Mode='{mode}'.")
-        return
-
-    for idx, list_url in enumerate(pages, 1):
+    for idx, list_url in enumerate(get_list_page_urls("kauf"), 1):
         try:
             detail_links = collect_detail_links(list_url)
         except Exception as e:
             print(f"[WARN] Abbruch beim Lesen der Liste: {list_url} -> {e}")
             break
 
-        if not detail_links:
-            print(f"[INFO] Keine Einträge auf Seite {idx} – Stop.")
-            break
-
         new_links = [u for u in detail_links if u not in seen]
+        if idx > 1 and not new_links:
+            print(f"[INFO] Keine neuen Links auf Seite {idx} – Stop.")
+            break
         seen.update(new_links)
-        if not new_links:
-            print(f"[INFO] Seite {idx}: keine neuen Links – weiter.")
-            continue
+        print(f"[Seite {idx}] {len(new_links)} neue Detailseiten")
 
-        print(f"[{mode.upper()}] Seite {idx}: {len(new_links)} Exposés")
         for j, url in enumerate(new_links, 1):
             try:
                 row = parse_detail(url, mode)
-                unterkat = decide_subcategory(row, mode)
-                record = make_record(row, kategorie_main, unterkat)
+                unterkat = decide_subcategory(row)
+                record = make_record(row, unterkat)
                 all_rows.append(record)
-                print(f"  - ({j}/{len(new_links)}) {record['Titel'][:60]} → {record['Kategorie']} / {record['Unterkategorie']}")
+                print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
                 time.sleep(0.15)
             except Exception as e:
                 print(f"    [FEHLER] {url} -> {e}")
                 continue
         time.sleep(0.25)
 
-    if all_rows:
-        cols = ["Titel","Kategorie","Unterkategorie","Webseite","Objektnummer","Beschreibung","Bild","Preis","Standort"]
-        with open(csv_name, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            w.writerows(all_rows)
-        print(f"[OK] CSV gespeichert: {csv_name} ({len(all_rows)} Zeilen)")
-
-        if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
-            sync_category(all_rows, kategorie_main)
-        else:
-            print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
-    else:
+    if not all_rows:
         print("[WARN] Keine Datensätze gefunden.")
+        return
+
+    rows_kauf  = [r for r in all_rows if r["Kategorie"] == "Kaufen"]
+    rows_miete = [r for r in all_rows if r["Kategorie"] == "Mieten"]
+
+    # Filter je nach Modus
+    if mode == "kauf":
+        rows_miete = []
+    elif mode == "miete":
+        rows_kauf = []
+
+    # CSVs schreiben
+    cols = ["Titel","Kategorie","Unterkategorie","Webseite","Objektnummer","Beschreibung","Bild","Preis","Standort"]
+    if rows_kauf:
+        with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows_kauf)
+        print(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
+    if rows_miete:
+        with open(csv_miete, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows_miete)
+        print(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
+
+    # Upsert je Kategorie
+    if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
+        if rows_kauf:
+            sync_category(rows_kauf, "Kaufen")
+        if rows_miete:
+            sync_category(rows_miete, "Mieten")
+    else:
+        print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    mode = (sys.argv[1].strip().lower() if len(sys.argv) > 1 else "kauf")
+    mode = (sys.argv[1].strip().lower() if len(sys.argv) > 1 else "auto")
     run(mode)
