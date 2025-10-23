@@ -34,6 +34,9 @@ MSI_RENDER         = os.getenv("MSI_RENDER", "0").strip() == "1"
 MSI_RENDER_ENGINE  = os.getenv("MSI_RENDER_ENGINE", "playwright").strip().lower()
 MSI_RENDER_TIMEOUT = int(os.getenv("MSI_RENDER_TIMEOUT", "20000"))
 
+# iFrame-DOMs zwischenspeichern (Haupt-URL -> [frame_html1, ...])
+FRAME_HTMLS: dict[str, list[str]] = {}
+
 # ===========================================================================
 # REGEX & KONSTANTEN
 # ===========================================================================
@@ -50,7 +53,6 @@ RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Z
 RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
 RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
-# Footer/CTA/Contact-Filter (aus Beschreibung fernhalten)
 STOP_STRINGS = (
     "Ihre Anfrage", "Exposé anfordern", "Neueste Immobilien", "Teilen auf",
     "Datenschutz", "Impressum", "designed by wavepoint",
@@ -66,17 +68,21 @@ TAB_LABELS = {
     "Energieausweis": ("energieausweis","energie","energiekennwerte"),
 }
 
+RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
+RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
 # ===========================================================================
-# HTTP / HTML – immer rendern, wenn MSI_RENDER=1
+# HTTP / HTML – immer rendern, wenn MSI_RENDER=1 (inkl. iFrames)
 # ===========================================================================
 def _simple_fetch(url: str) -> BeautifulSoup:
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
 
-def _render_with_playwright(url: str, timeout_ms: int) -> str:
-    """Headless-Rendering via Playwright."""
+def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
+    """Headless-Rendering via Playwright. Liefert (main_html, [frame_htmls...])."""
     from playwright.sync_api import sync_playwright
+    frame_htmls = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(locale="de-DE", user_agent=HEADERS["User-Agent"])
@@ -105,7 +111,7 @@ def _render_with_playwright(url: str, timeout_ms: int) -> str:
         except Exception:
             pass
 
-        # Warten bis Panel-Inhalt wirklich steht (p unter .v-card__text)
+        # auf Panel-Inhalt warten
         try:
             page.wait_for_selector(
                 ".v-expose .v-tabs-items .v-window__container #tab-0 .v-card__text p:not(.h4), "
@@ -114,31 +120,42 @@ def _render_with_playwright(url: str, timeout_ms: int) -> str:
                 timeout=timeout_ms//2
             )
         except Exception:
-            # letzte Chance
             time.sleep(0.8)
 
-        # network idle hilft oft bei Vuetify
+        # **NEU**: iFrames auslesen (screenwork/immo o.ä.)
+        try:
+            for fr in page.frames:
+                fr_url = (fr.url or "").lower()
+                if any(k in fr_url for k in ("screenwork", "immo", "expose", "angebote")):
+                    try:
+                        frame_htmls.append(fr.content())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # networkidle hilft oft
         try:
             page.wait_for_load_state("networkidle", timeout=timeout_ms//2)
         except Exception:
             pass
 
-        html = page.content()
+        main_html = page.content()
         context.close()
         browser.close()
-        return html
+        return main_html, frame_htmls
 
-def _render_with_requests_html(url: str, timeout_ms: int) -> str:
-    """Fallback-Renderer."""
+def _render_with_requests_html(url: str, timeout_ms: int) -> tuple[str, list[str]]:
+    """Einfacher Renderer. iFrames kann requests-html i.d.R. nicht auslesen -> nur main_html."""
     from requests_html import HTMLSession
     s = HTMLSession()
     r = s.get(url, headers=HEADERS, timeout=30)
     r.html.render(timeout=timeout_ms/1000.0, reload=False, scrolldown=0)
-    return r.html.html
+    return r.html.html, []
 
 def soup_get(url: str) -> BeautifulSoup:
     """
-    Wenn MSI_RENDER=1 → *immer* rendern (Playwright/requests_html).
+    Wenn MSI_RENDER=1 → rendern (Playwright bevorzugt) und iFrame-HTMLs in FRAME_HTMLS[url] sichern.
     Sonst normal mit requests.
     """
     if not MSI_RENDER:
@@ -146,24 +163,27 @@ def soup_get(url: str) -> BeautifulSoup:
 
     try:
         if MSI_RENDER_ENGINE == "requests_html":
-            html = _render_with_requests_html(url, MSI_RENDER_TIMEOUT)
+            main_html, frames = _render_with_requests_html(url, MSI_RENDER_TIMEOUT)
         else:
-            html = _render_with_playwright(url, MSI_RENDER_TIMEOUT)
-        if html:
-            soup = BeautifulSoup(html, "lxml")
-            # Debug-Ausgabe: einmalig grob prüfen, ob wir mehr Inhalt haben
+            main_html, frames = _render_with_playwright(url, MSI_RENDER_TIMEOUT)
+        if frames:
+            FRAME_HTMLS[url] = frames
+        else:
+            FRAME_HTMLS[url] = []
+        if main_html:
+            soup = BeautifulSoup(main_html, "lxml")
             dbg_len = len(soup.get_text(" ", strip=True))
-            print(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | textlen={dbg_len}")
+            print(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | main_textlen={dbg_len} | frames={len(frames)}")
             return soup
     except Exception as e:
         print(f"[RENDER] Fehler ({MSI_RENDER_ENGINE}): {e}")
 
     # Fallback ohne Render
-    print("[RENDER] Fallback: simple fetch")
+    print("[RENDER] Fallback: simple fetch (keine Frames)")
+    FRAME_HTMLS[url] = []
     return _simple_fetch(url)
 
 def get_list_page_urls(mode: str, max_pages: int = 50):
-    """MSI listet Kauf & Miete gemeinsam unter /kaufen/immobilienangebote/, paginiert mit /page/{n}/"""
     first = f"{BASE}/kaufen/immobilienangebote/"
     pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
     return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
@@ -254,7 +274,6 @@ def _find_tab_navs(soup):
     return pairs
 
 def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
-    """Suche im Panel 'Objektangaben' nach Kaufpreis/Miete."""
     tab_pairs = _find_tab_navs(soup)
     target_panel = None
     for label, panel in tab_pairs:
@@ -289,7 +308,6 @@ def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
     return ""
 
 def extract_price_near_objnr(soup: BeautifulSoup) -> str:
-    """Sucht Preis im Kopfbereich in der Nähe von 'Objekt-Nr.' (typisch MSI)."""
     obj_nodes = soup.find_all(string=re.compile(r"Objekt[-\s]?Nr", re.I))
     for txtnode in obj_nodes:
         container = txtnode
@@ -424,9 +442,6 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
 # ===========================================================================
 # BESCHREIBUNG – NUR TAB "BESCHREIBUNG"
 # ===========================================================================
-RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
-RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
 def _clean_desc_lines(lines):
     out, seen = [], set()
     for t in lines:
@@ -451,14 +466,12 @@ def _find_expose_scope(soup: BeautifulSoup) -> Tag:
 def extract_description(soup: BeautifulSoup) -> str:
     """
     Nur den Inhalt des Tabs 'Beschreibung' liefern.
-    Suchstrategie:
-      - scope: .sw-yframe .sw-vframe .v-expose → .v-expose → soup
-      - Panel: #tab-0 → aktives .v-window-item.v-window-item--active
-      - Container: .v-card__text; sammle alle p:not(.h4) + li
+    - scope: .sw-yframe .sw-vframe .v-expose → .v-expose → soup
+    - Panel: #tab-0 → aktives .v-window-item.v-window-item--active
+    - Container: .v-card__text; sammle alle p:not(.h4) + li
     """
     root = _find_expose_scope(soup)
 
-    # 1) bevorzugt #tab-0
     candidates = []
     tab0 = root.select_one(".v-tabs-items .v-window__container #tab-0")
     if tab0:
@@ -467,7 +480,6 @@ def extract_description(soup: BeautifulSoup) -> str:
     if active and active not in candidates:
         candidates.append(active)
 
-    # 2) Fallback: jeder .v-card__text mit Head 'Beschreibung'
     if not candidates:
         for box in root.select(".v-card__text"):
             head = box.select_one("p.h4, h4")
@@ -477,16 +489,13 @@ def extract_description(soup: BeautifulSoup) -> str:
     for node in candidates:
         box = node.select_one(".v-card .v-card__text") or node.select_one(".v-card__text") or node
         lines = []
-        # Überschrift raus
         head = box.select_one("p.h4, h4")
-        # Absätze
         for p in box.select("p"):
             if p is head or ("h4" in (p.get("class") or [])):
                 continue
             txt = _norm(p.get_text(" ", strip=True))
             if txt:
                 lines.append(txt)
-        # Listen
         for li in box.select("ul li, ol li"):
             t = _norm(li.get_text(" ", strip=True))
             if t:
@@ -496,6 +505,26 @@ def extract_description(soup: BeautifulSoup) -> str:
         if lines:
             return ("\n".join(lines))[:6000]
 
+    return ""
+
+def get_description(detail_url: str, main_soup: BeautifulSoup) -> str:
+    """
+    Erst Haupt-DOM versuchen; wenn leer und wir haben iFrame-HTMLs,
+    versuche nacheinander in allen iFrame-DOMs.
+    """
+    desc = extract_description(main_soup)
+    if desc:
+        return desc
+
+    frames = FRAME_HTMLS.get(detail_url) or []
+    for html in frames:
+        try:
+            s_frame = BeautifulSoup(html, "lxml")
+            desc = extract_description(s_frame)
+            if desc:
+                return desc
+        except Exception:
+            continue
     return ""
 
 # ===========================================================================
@@ -517,7 +546,8 @@ def parse_detail(detail_url: str, mode: str):
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
-    description = extract_description(soup)
+    # *** WICHTIG: Beschreibung über Haupt- und iFrame-DOMs holen ***
+    description = get_description(detail_url, soup)
 
     m_obj = RE_OBJEKTNR.search(page_text)
     objektnummer = m_obj.group(1).strip() if m_obj else ""
@@ -556,7 +586,7 @@ def parse_detail(detail_url: str, mode: str):
     }
 
 # ===========================================================================
-# AIRTABLE – HELFER (vollständig)
+# AIRTABLE – HELFER
 # ===========================================================================
 def airtable_table_segment():
     if AIRTABLE_TABLE_ID:
@@ -592,7 +622,6 @@ def airtable_existing_fields():
     return set()
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set = None) -> dict:
-    """Alle Keys senden (bis auf leeren Preis)."""
     out = dict(record)
     if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
         out.pop("Preis", None)
