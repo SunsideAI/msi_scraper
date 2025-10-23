@@ -50,7 +50,6 @@ def collect_detail_links(list_url: str):
 # Regex / Konstanten
 # ---------------------------------------------------------------------------
 THIN_SPACES = "\u00A0\u202F\u2009"  # NBSP, NARROW NBSP, THIN SPACE
-
 RE_EUR_NUMBER = re.compile(r"\b\d{1,3}(?:[.\u00A0\u202F\u2009]\d{3})*(?:,\d{2})?\b")
 RE_EUR_ANY    = re.compile(r"\b\d{1,3}(?:[.\u00A0\u202F\u2009]\d{3})*(?:,\d{2})?\s*[€EUR]?")
 RE_PRICE_LINE = re.compile(
@@ -63,7 +62,6 @@ RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Z
 RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
 RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
 
-# Stoppwörter im Content
 STOP_STRINGS = ("Ihre Anfrage", "Kontakt", "Exposé anfordern", "Neueste Immobilien", "Teilen auf")
 
 TAB_LABELS = {
@@ -310,16 +308,19 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
         return clean_price_string(best)
     return ""
 
-# -------------------- Beschreibung (Vuetify + Fallbacks) --------------------
+# -------------------- Beschreibung (Vuetify global + Fallbacks) --------------------
 def _harvest_block(el: Tag, lines: list):
-    if el.name == "p":
+    if not isinstance(el, Tag):
+        return
+    if el.name == "p" and "h4" not in (el.get("class") or []):
         t = _norm(el.get_text(" ", strip=True))
         if t and not any(stop in t for stop in STOP_STRINGS):
             lines.append(t)
     elif el.name in ("ul", "ol"):
         for li in el.select("li"):
             t = _norm(li.get_text(" ", strip=True))
-            if t: lines.append(f"• {t}")
+            if t:
+                lines.append(f"• {t}")
     elif el.name == "table":
         for tr in el.select("tr"):
             cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
@@ -335,111 +336,69 @@ def _harvest_block(el: Tag, lines: list):
             if k or v:
                 lines.append(f"- {k}: {v}".strip(" -:"))
 
-def _collect_vuetify_sections(soup: BeautifulSoup):
-    """
-    Liest Bereiche aus .v-card__text mit <p class='h4'>Überschriften (MSI/Vuetify).
-    Sammelt NUR innerhalb desselben Containers die folgenden Blöcke bis zum nächsten <p.h4>.
-    """
-    parts = []
-    for box in soup.select(".v-card__text"):
-        # Direkt-Kinder-Überschriften bevorzugen; sonst alle h4 darunter
-        headers = box.select("> p.h4") or box.select("p.h4")
-        for h in headers:
-            title_text = _norm(h.get_text(" ", strip=True))
-            key_lower = title_text.lower()
-            match_name = None
-            for nice, aliases in TAB_LABELS.items():
-                if key_lower == nice.lower() or any(key_lower == a for a in aliases):
-                    match_name = nice
-                    break
-            if not match_name:
-                continue
-
-            # Geschwister im selben Container ablaufen
-            lines = []
-            node = h.next_sibling
-            while node:
-                if isinstance(node, NavigableString):
-                    node = node.next_sibling
-                    continue
-                if not isinstance(node, Tag):
-                    node = node.next_sibling
-                    continue
-                # Stop falls nächster Abschnitt oder Container-Verlassen
-                if node.name == "p" and "h4" in (node.get("class") or []):
-                    break
-                # Sicherstellen, dass node innerhalb des box-Containers liegt
-                if box not in node.parents and node is not box:
-                    break
-                # Sammeln
-                _harvest_block(node, lines)
-                # Safety: auf Kinder prüfen (falls Wrapper-Divs)
-                for child in node.find_all(recursive=False):
-                    if isinstance(child, Tag):
-                        _harvest_block(child, lines)
-                if len(lines) >= 200:
-                    break
-                node = node.next_sibling
-
-            if lines:
-                parts.append(f"{match_name}:\n" + "\n".join(lines))
-    return parts
-
-def _collect_tabbed_sections(soup: BeautifulSoup):
-    """Kadence/Elementor Tabs (Fallback)."""
-    parts = []
-    panels = soup.select('[role="tabpanel"], .kt-tabs-content-wrap > *')
-    if not panels:
-        return parts
-    nav_labels = {}
-    for a in soup.select('a[role="tab"], .kt-tabs-title-list a, .elementor-tab-title'):
-        lab = _norm(getattr(a, "get_text", lambda *args, **kw: "")(" ", strip=True))
-        target = a.get("href") or a.get("data-tab") or a.get("aria-controls") or ""
-        if target and target.startswith("#"):
-            nav_labels[target[1:]] = lab
-        elif target:
-            nav_labels[str(target)] = lab
-    label_map = {}
-    for p in panels:
-        pid = p.get("id", "")
-        label = nav_labels.get(pid, "").lower()
-        txt_label = ""
-        for nice, aliases in TAB_LABELS.items():
-            if label and any(a in label for a in aliases):
-                txt_label = nice
-                break
-        if not txt_label:
-            preview = p.get_text(" ", strip=True).lower()
-            for nice, aliases in TAB_LABELS.items():
-                if any(a in preview for a in aliases):
-                    txt_label = nice
-                    break
-        lines = []
-        _harvest_block(p, lines)
-        for child in p.find_all(recursive=True):
-            if isinstance(child, Tag):
-                _harvest_block(child, lines)
-        if lines and txt_label:
-            label_map.setdefault(txt_label, []).extend(lines)
-    if label_map:
-        for order in ("Beschreibung", "Objektangaben", "Ausstattung", "Lage", "Energieausweis"):
-            if order in label_map and label_map[order]:
-                parts.append(f"{order}:\n" + "\n".join(label_map[order]))
-    return parts
-
 def extract_description(soup: BeautifulSoup) -> str:
     """
-    Zieht Inhalte aus allen 5 Bereichen (Beschreibung, Objektangaben, Ausstattung, Lage, Energieausweis).
-    Unterstützt Vuetify (p.h4 in .v-card__text) + Tabs (Kadence/Elementor) + Fallbacks.
+    MSI/Vuetify: Abschnitte sind global als <p class="h4">Beschreibung|Ausstattung|Lage|...
+    Wir scannen ALLE p.h4-Überschriften und sammeln deren next_siblings bis zur nächsten p.h4.
     """
-    parts = _collect_vuetify_sections(soup)
-    if not parts:
-        parts = _collect_tabbed_sections(soup)
+    wanted = {
+        "beschreibung":   "Beschreibung",
+        "ausstattung":    "Ausstattung",
+        "lage":           "Lage",
+        "objektangaben":  "Objektangaben",
+        "objektdaten":    "Objektangaben",
+        "daten":          "Objektangaben",
+        "energieausweis": "Energieausweis",
+        "energie":        "Energieausweis",
+        "energiekennwerte":"Energieausweis",
+    }
+
+    parts = []
+    h4s = soup.select("p.h4")
+    if h4s:
+        for h in h4s:
+            head = _norm(h.get_text(" ", strip=True)).lower()
+            key = wanted.get(head)
+            if not key:
+                continue
+
+            lines = []
+            for sib in h.next_siblings:
+                if isinstance(sib, NavigableString):
+                    continue
+                if isinstance(sib, Tag):
+                    # Stop bei nächster Abschnittsüberschrift
+                    if sib.name == "p" and "h4" in (sib.get("class") or []):
+                        break
+                    # Stop bei Social/Share
+                    txt = sib.get_text(" ", strip=True) if hasattr(sib, "get_text") else ""
+                    if any(stop.lower() in (txt or "").lower() for stop in STOP_STRINGS):
+                        break
+                    # Inhalte dieses Blocks ernten
+                    _harvest_block(sib, lines)
+                    # flache Kinder (Wrapper) mitnehmen
+                    for child in sib.find_all(recursive=False):
+                        _harvest_block(child, lines)
+                    if len(lines) >= 200:
+                        break
+
+            if lines:
+                parts.append(f"{key}:\n" + "\n".join(lines))
 
     if parts:
         return ("\n\n".join(parts).strip())[:6000]
 
-    # Generische Fallbacks:
+    # Fallbacks (Tabs/Container, generische Container, Meta)
+    panels = soup.select('[role="tabpanel"], .kt-tabs-content-wrap > *')
+    if panels:
+        lines = []
+        for p in panels:
+            _harvest_block(p, lines)
+            for child in p.find_all(recursive=True):
+                _harvest_block(child, lines)
+        if lines:
+            return ("Beschreibung:\n" + "\n".join(lines))[:6000]
+
     for c in soup.select(".entry-content, article, .content, .post-content, .single-content, [class*='content'], [class*='text']"):
         ps = [p.get_text(" ", strip=True) for p in c.select("p")]
         ps = [p for p in ps if p and not any(stop in p for stop in STOP_STRINGS)]
@@ -452,30 +411,6 @@ def extract_description(soup: BeautifulSoup) -> str:
     md = soup.select_one('meta[name="description"]')
     if md and md.get("content"):
         return md["content"].strip()
-
-    # Feature-Fallback
-    features = []
-    for li in soup.select("li"):
-        t = _norm(li.get_text(" ", strip=True))
-        if not t: continue
-        if re.search(r"\b(zimmer|schlafzimmer|badezimmer|wohnfl|wohnfläche|grundstück|nutzfl|balkon|terrasse|garage|stellplatz|baujahr|energie)\b", t, re.I):
-            if not any(stop in t for stop in STOP_STRINGS):
-                features.append(t)
-    features = list(dict.fromkeys(features))
-    if features:
-        return " • ".join(features[:20])
-
-    h1 = soup.select_one("h1")
-    if h1:
-        ps = []
-        for sib in h1.find_all_next():
-            if sib.name == "p":
-                t = _norm(sib.get_text(" ", strip=True))
-                if t and not any(stop in t for stop in STOP_STRINGS):
-                    ps.append(t)
-                if len(ps) >= 8: break
-        if ps:
-            return "\n\n".join(ps).strip()
 
     return ""
 
@@ -535,8 +470,6 @@ KEYS_WOHNUNG    = ["wohnung","etagenwohnung","eigentumswohnung","apartment","dac
 KEYS_HAUS       = ["haus","einfamilienhaus","zweifamilienhaus","reihenhaus","doppelhaushälfte","stadtvilla","mehrfamilienhaus","dhh"]
 KEYS_GEWERBE    = ["gewerbe","büro","laden","praxis","lager","halle","gastronomie","gewerbeeinheit","gewerbefläche"]
 KEYS_KAPITAL    = ["kapitalanlage","rendite","vermietet","anlageobjekt","investment"]
-KEYS_STELLPLATZ = ["stellplatz","parkplatz","tiefgarage","garage","carport"]
-
 def heuristic_subcategory(row):
     text = f"{row.get('Titel','')} {row.get('Description','')}".lower()
     score = {"Wohnung":0, "Haus":0, "Gewerbe":0, "Kapitalanlage":0}
