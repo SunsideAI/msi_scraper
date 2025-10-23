@@ -32,10 +32,7 @@ def soup_get(url: str) -> BeautifulSoup:
     return BeautifulSoup(r.text, "lxml")
 
 def get_list_page_urls(mode: str, max_pages: int = 50):
-    """
-    MSI listet Kauf & Miete gemeinsam unter /kaufen/immobilienangebote/, paginiert mit /page/{n}/
-    -> Für alle Modi dieselbe Listing-Quelle.
-    """
+    """MSI listet Kauf & Miete gemeinsam unter /kaufen/immobilienangebote/, paginiert mit /page/{n}/"""
     first = f"{BASE}/kaufen/immobilienangebote/"
     pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
     return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
@@ -69,11 +66,11 @@ RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b
 STOP_STRINGS = ("Ihre Anfrage", "Kontakt", "Exposé anfordern", "Neueste Immobilien")
 
 TAB_LABELS = {
-    "Beschreibung":   ("Beschreibung",),
-    "Objektangaben":  ("Objektangaben","Objektdaten","Daten"),
-    "Ausstattung":    ("Ausstattung","Merkmale"),
-    "Lage":           ("Lage","Lagebeschreibung","Umfeld"),
-    "Energieausweis": ("Energieausweis","Energie","Energiekennwerte"),
+    "Beschreibung":   ("beschreibung",),
+    "Objektangaben":  ("objektangaben","objektdaten","daten"),
+    "Ausstattung":    ("ausstattung","merkmale"),
+    "Lage":           ("lage","lagebeschreibung","umfeld"),
+    "Energieausweis": ("energieausweis","energie","energiekennwerte"),
 }
 
 # ---------------------------------------------------------------------------
@@ -107,7 +104,7 @@ def _normalize_numstring(s: str) -> str:
     return s
 
 def clean_price_string(raw: str) -> str:
-    """Gibt einen hübsch formatierten Preis-String zurück, z. B. '479.000 €'."""
+    """Retourniert formatierten Preis-String, z. B. '479.000 €'."""
     if not raw:
         return ""
     m = RE_EUR_NUMBER.search(raw)
@@ -121,7 +118,7 @@ def clean_price_string(raw: str) -> str:
     return f"{val:,.0f} €".replace(",", ".")
 
 def parse_price_to_number(label: str):
-    """Wandelt beliebige Preis-Strings robust zu float (Euro)."""
+    """Wandelt Preis-Strings robust zu float (Euro)."""
     if not label:
         return None
     m = RE_EUR_NUMBER.search(label)
@@ -148,7 +145,6 @@ def _panel_from_tablink(a_tag):
 
 def _find_tab_navs(soup):
     pairs = []
-    # Kadence / Elementor / generisch
     for nav in soup.select(".kt-tabs-title-list, .nav-tabs, .elementor-tabs-wrapper, ul"):
         for a in nav.select('a[href^="#"], a[aria-controls]'):
             label = _norm(a.get_text(" ", strip=True))
@@ -164,18 +160,16 @@ def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
     tab_pairs = _find_tab_navs(soup)
     target_panel = None
     for label, panel in tab_pairs:
-        if any(alias.lower() in label.lower() for alias in TAB_LABELS["Objektangaben"]):
+        if any(alias in label.lower() for alias in TAB_LABELS["Objektangaben"]):
             target_panel = panel
             break
     if not target_panel:
-        # Fallback: irgendeine Tabelle mit 'Kaufpreis'
         for tbl in soup.select("table"):
             if "kaufpreis" in tbl.get_text(" ", strip=True).lower():
                 target_panel = tbl
                 break
     if not target_panel:
         return ""
-
     keys = ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")
     for tr in target_panel.select("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
@@ -195,13 +189,11 @@ def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
     return ""
 
 def extract_price_near_objnr(soup: BeautifulSoup) -> str:
-    """
-    Sucht Preis im Kopfbereich in der Nähe von 'Objekt-Nr.' (wie im MSI-Layout).
-    """
+    """Sucht Preis im Kopfbereich in der Nähe von 'Objekt-Nr.' (typisch MSI)."""
     obj_nodes = soup.find_all(string=re.compile(r"Objekt[-\s]?Nr", re.I))
     for txtnode in obj_nodes:
         container = txtnode
-        for _ in range(4):  # etwas nach oben klettern
+        for _ in range(4):
             if hasattr(container, "parent"):
                 container = container.parent
         context = container.get_text(" ", strip=True)
@@ -317,7 +309,7 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
         return clean_price_string(best)
     return ""
 
-# -------------------- Beschreibung aus Tabs/Boxen --------------------
+# -------------------- Beschreibung (Vuetify + Fallbacks) --------------------
 def _harvest_panel(panel):
     lines = []
     for p in panel.select("p"):
@@ -346,13 +338,79 @@ def _harvest_panel(panel):
         if len(out) >= 200: break
     return out
 
-def _collect_tabbed_sections(soup):
+def _gather_until_next_heading(start_node):
+    """Sammelt Text ab start_node bis zur nächsten <p class='h4'>."""
+    lines = []
+    for sib in start_node.find_all_next():
+        if sib is start_node:
+            continue
+        if sib.name == "p" and "h4" in sib.get("class", []):
+            break
+        # sammeln
+        if sib.name == "p":
+            t = _norm(sib.get_text(" ", strip=True))
+            if t and not any(stop in t for stop in STOP_STRINGS):
+                lines.append(t)
+        if sib.name in ("ul", "ol"):
+            for li in sib.select("li"):
+                t = _norm(li.get_text(" ", strip=True))
+                if t:
+                    lines.append(f"• {t}")
+        if sib.name == "table":
+            for tr in sib.select("tr"):
+                cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
+                if len(cells) >= 2:
+                    lines.append(f"- {cells[0]}: {cells[1]}")
+                elif cells:
+                    lines.append(" ".join(cells))
+        if sib.name == "dl":
+            for dt in sib.select("dt"):
+                dd = dt.find_next_sibling("dd")
+                k = _norm(dt.get_text(" ", strip=True))
+                v = _norm(dd.get_text(" ", strip=True)) if dd else ""
+                if k or v:
+                    lines.append(f"- {k}: {v}".strip(" -:"))
+        if len(lines) >= 200:
+            break
+    # Dedupe
+    out, seen = [], set()
+    for ln in lines:
+        if ln and ln not in seen:
+            out.append(ln); seen.add(ln)
+    return out
+
+def _collect_vuetify_sections(soup):
+    """Liest Bereiche aus .v-card__text mit <p class='h4'>Überschriften (MSI/Vuetify)."""
     parts = []
-    # Panels mit role="tabpanel" und Kadence-Container
+    for box in soup.select(".v-card__text"):
+        for h in box.select("p.h4"):
+            head = _norm(h.get_text(" ", strip=True))
+            key_lower = head.lower()
+            match_name = None
+            for nice, aliases in TAB_LABELS.items():
+                if any(key_lower == a for a in aliases) or key_lower == nice.lower():
+                    match_name = nice
+                    break
+            if not match_name:
+                continue
+            lines = _gather_until_next_heading(h)
+            if lines:
+                parts.append(f"{match_name}:\n" + "\n".join(lines))
+    return parts
+
+def _find_box_heading(soup, text_candidates):
+    for el in soup.find_all(True, string=True):
+        txt = _norm(el.get_text(" ", strip=True))
+        if txt and any(txt.lower() == cand for cand in text_candidates):
+            return el
+    return None
+
+def _collect_tabbed_sections(soup):
+    """Kadence/Elementor Tabs (Fallback)."""
+    parts = []
     panels = soup.select('[role="tabpanel"], .kt-tabs-content-wrap > *')
     if not panels:
         return parts
-    # Tab-Labels aus Navigations-Links auflösen
     nav_labels = {}
     for a in soup.select('a[role="tab"], .kt-tabs-title-list a, .elementor-tab-title'):
         lab = _norm(getattr(a, "get_text", lambda *args, **kw: "")(" ", strip=True))
@@ -361,82 +419,43 @@ def _collect_tabbed_sections(soup):
             nav_labels[target[1:]] = lab
         elif target:
             nav_labels[str(target)] = lab
-
     label_map = {}
     for p in panels:
         pid = p.get("id", "")
         label = nav_labels.get(pid, "").lower()
         txt_label = ""
         for nice, aliases in TAB_LABELS.items():
-            if label and any(a.lower() in label for a in aliases):
+            if label and any(a in label for a in aliases):
                 txt_label = nice
                 break
         if not txt_label:
             preview = p.get_text(" ", strip=True).lower()
             for nice, aliases in TAB_LABELS.items():
-                if any(a.lower() in preview for a in aliases):
+                if any(a in preview for a in aliases):
                     txt_label = nice
                     break
         lines = _harvest_panel(p)
         if lines and txt_label:
             label_map.setdefault(txt_label, []).extend(lines)
-
     if label_map:
         for order in ("Beschreibung", "Objektangaben", "Ausstattung", "Lage", "Energieausweis"):
             if order in label_map and label_map[order]:
                 parts.append(f"{order}:\n" + "\n".join(label_map[order]))
     return parts
 
-def _find_box_heading(soup, text_candidates):
-    for el in soup.find_all(True, string=True):
-        txt = _norm(el.get_text(" ", strip=True))
-        if txt and any(txt.lower() == cand.lower() for cand in text_candidates):
-            return el
-    return None
-
-def _collect_box_after_heading(start_el):
-    if not start_el:
-        return []
-    lines = []
-    for sib in start_el.parent.find_all_next():
-        if sib == start_el: 
-            continue
-        if sib.name in ("h2","h3","h4"):
-            break
-        if sib.has_attr("class") and any(k in " ".join(sib.get("class")) for k in ("kt-tabs", "elementor-tabs", "sidebar", "widget")):
-            break
-        lines.extend(_harvest_panel(sib))
-        if len(lines) >= 200: 
-            break
-    out, seen = [], set()
-    for ln in lines:
-        if ln and ln not in seen:
-            out.append(ln); seen.add(ln)
-    return out
-
 def extract_description(soup: BeautifulSoup) -> str:
     """
     Zieht Inhalte aus allen 5 Bereichen (Beschreibung, Objektangaben, Ausstattung, Lage, Energieausweis).
-    Erkennt Tabs (Kadence/Elementor) und fallbackt auf Boxen mit gleichen Überschriften.
+    Unterstützt Vuetify (p.h4 in .v-card__text) + Tabs (Kadence/Elementor) + Fallbacks.
     """
-    parts = _collect_tabbed_sections(soup)
-
+    parts = _collect_vuetify_sections(soup)
     if not parts:
-        for nice, aliases in TAB_LABELS.items():
-            hdr = soup.find(lambda tag: tag.name in ("h2","h3","h4") and
-                            any(_norm(tag.get_text(" ", strip=True)).lower() == a.lower() for a in aliases))
-            if not hdr:
-                hdr = soup.find(lambda tag: any(tag.name in ("a","div","span") for _ in [0]) and
-                                any(_norm(tag.get_text(" ", strip=True)).lower() == a.lower() for a in aliases))
-            if hdr:
-                lines = _collect_box_after_heading(hdr)
-                if lines:
-                    parts.append(f"{nice}:\n" + "\n".join(lines))
+        parts = _collect_tabbed_sections(soup)
 
     if parts:
         return ("\n\n".join(parts).strip())[:6000]
 
-    # Fallbacks:
+    # Generische Fallbacks:
     for c in soup.select(".entry-content, article, .content, .post-content, .single-content, [class*='content'], [class*='text']"):
         ps = [p.get_text(" ", strip=True) for p in c.select("p")]
         ps = [p for p in ps if p and not any(stop in p for stop in STOP_STRINGS)]
@@ -445,12 +464,10 @@ def extract_description(soup: BeautifulSoup) -> str:
 
     ogd = soup.select_one('meta[property="og:description"]')
     if ogd and ogd.get("content"):
-        c = ogd["content"].strip()
-        if c: return c
+        return ogd["content"].strip()
     md = soup.select_one('meta[name="description"]')
     if md and md.get("content"):
-        c = md["content"].strip()
-        if c: return c
+        return md["content"].strip()
 
     # Feature-Fallback
     features = []
@@ -677,7 +694,7 @@ def airtable_list_all():
 # Felder/Keys
 # ---------------------------------------------------------------------------
 def make_record(row, unterkat):
-    # Preis als Euro (ohne ×100)
+    # Preis als Euro (OHNE ×100)
     base_num = parse_price_to_number(row["Preis"])
     preis_value = float(base_num) if base_num is not None else None
 
@@ -689,7 +706,7 @@ def make_record(row, unterkat):
         "Objektnummer":    row["Objektnummer"],
         "Beschreibung":    row["Description"],
         "Bild":            row["Bild_URL"],
-        "Preis":           preis_scaled,
+        "Preis":           preis_value,
         "Standort":        row["Ort"],
     }
 
