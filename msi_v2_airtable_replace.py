@@ -1,6 +1,12 @@
 # msi_v2_airtable_replace.py
 # -*- coding: utf-8 -*-
-import sys, time, csv, os, json, requests, re
+import sys
+import time
+import csv
+import os
+import json
+import requests
+import re
 from urllib.parse import quote, urljoin
 from bs4 import BeautifulSoup, NavigableString, Tag
 
@@ -26,6 +32,7 @@ def soup_get(url: str) -> BeautifulSoup:
     return BeautifulSoup(r.text, "lxml")
 
 def get_list_page_urls(mode: str, max_pages: int = 50):
+    """MSI listet Kauf & Miete gemeinsam unter /kaufen/immobilienangebote/, paginiert mit /page/{n}/"""
     first = f"{BASE}/kaufen/immobilienangebote/"
     pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
     return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
@@ -176,12 +183,15 @@ def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
     for tr in target_panel.select("tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
         if len(cells) >= 2 and any(k in cells[0].lower() for k in keys):
-            got = clean_price_string(cells[1]);  if got: return got
+            got = clean_price_string(cells[1])
+            if got:
+                return got
     for dt in target_panel.select("dt"):
         dd = dt.find_next_sibling("dd")
         if any(k in (dt.get_text(" ", strip=True) or "").lower() for k in keys):
             got = clean_price_string(dd.get_text(" ", strip=True) if dd else "")
-            if got: return got
+            if got:
+                return got
     for li in target_panel.select("li"):
         txt = li.get_text(" ", strip=True)
         m = RE_PRICE_LINE.search(txt)
@@ -248,13 +258,16 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
             dd = dt.find_next_sibling("dd")
             if dd:
                 got = clean_price_string(dd.get_text(" ", strip=True))
-                if got: return got
+                if got:
+                    return got
     for tr in soup.select("table tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2:
             label = cells[0].lower()
             if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
-                got = clean_price_string(cells[1]);  if got: return got
+                got = clean_price_string(cells[1])
+                if got:
+                    return got
     for li in soup.select("li"):
         txt = li.get_text(" ", strip=True)
         m = RE_PRICE_LINE.search(txt)
@@ -273,39 +286,53 @@ def extract_price_strict_top(page_text: str) -> str:
     euros_filtered = []
     for e in euros:
         mm = RE_EUR_NUMBER.search(e)
-        if not mm: continue
+        if not mm:
+            continue
         try:
             val = float(_normalize_numstring(mm.group(0)))
             if val >= 10000:
                 euros_filtered.append(e)
-        except: continue
+        except:
+            continue
     if euros_filtered:
         return clean_price_string(euros_filtered[0])
     return ""
 
 def extract_price(soup: BeautifulSoup, page_text: str) -> str:
-    p = extract_price_near_objnr(soup);            if p: return p
-    p = extract_price_from_objektangaben(soup);    if p: return p
-    p = extract_price_from_jsonld(soup);           if p: return p
+    p = extract_price_near_objnr(soup)
+    if p:
+        return p
+    p = extract_price_from_objektangaben(soup)
+    if p:
+        return p
+    p = extract_price_from_jsonld(soup)
+    if p:
+        return p
     for line in page_text.splitlines():
         m = RE_PRICE_LINE.search(line.strip())
         if m:
             return clean_price_string(m.group(2) + " €")
-    p = extract_price_dom(soup);                   if p: return p
-    p = extract_price_strict_top(page_text);       if p: return p
+    p = extract_price_dom(soup)
+    if p:
+        return p
+    p = extract_price_strict_top(page_text)
+    if p:
+        return p
     euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
     if euros:
         def to_float(e):
             mm = RE_EUR_NUMBER.search(e)
-            if not mm: return 0.0
-            try: return float(_normalize_numstring(mm.group(0)))
-            except: return 0.0
+            if not mm:
+                return 0.0
+            try:
+                return float(_normalize_numstring(mm.group(0)))
+            except:
+                return 0.0
         best = max(euros, key=to_float)
         return clean_price_string(best)
     return ""
 
 # -------------------- BESCHREIBUNG – NUR TAB "BESCHREIBUNG" --------------------
-
 SECTION_ALIASES = {
     "beschreibung": {"beschreibung"},
     "objektangaben": {"objektangaben","objektdaten","daten"},
@@ -333,18 +360,23 @@ def _clean_lines(lines):
         if RE_PHONE.search(t) or RE_EMAIL.search(t) or RE_TEASER_LINE.match(t):
             continue
         if t and t not in seen:
-            out.append(t); seen.add(t)
+            out.append(t)
+            seen.add(t)
     return out
 
 def _find_expose_container(soup: BeautifulSoup) -> Tag:
     """Begrenzt die Suche auf den eigentlichen Exposé-Bereich (Vuetify)."""
     cand = soup.select_one(".v-expose")
-    if cand: return cand
+    if cand:
+        return cand
     cand = soup.select_one(".sw-vframe .v-expose")
-    if cand: return cand
-    for sel in ['div[id*="expose"]', 'section[id*="expose"]', '.immo-listing_infotext', '.expose', '.exposé']:
+    if cand:
+        return cand
+    for sel in ['div[id*="expose"]', 'section[id*="expose"]',
+                '.immo-listing_infotext', '.expose', '.exposé']:
         cand = soup.select_one(sel)
-        if cand: return cand
+        if cand:
+            return cand
     return soup
 
 def _text_from_container(container: Tag) -> list[str]:
@@ -355,21 +387,26 @@ def _text_from_container(container: Tag) -> list[str]:
         if "h4" in (p.get("class") or []):  # Überschrift selbst auslassen
             continue
         t = _norm(p.get_text(" ", strip=True))
-        if t: lines.append(t)
+        if t:
+            lines.append(t)
     # Listen
     for li in container.select("ul li, ol li"):
         t = _norm(li.get_text(" ", strip=True))
-        if t: lines.append("• " + t)
+        if t:
+            lines.append("• " + t)
     # einfache Tabellen / DL (falls doch vorhanden)
     for tr in container.select("table tr"):
         cells = [_norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th","td"])]
-        if len(cells) >= 2: lines.append(f"- {cells[0]}: {cells[1]}")
-        elif cells: lines.append(" ".join(cells))
+        if len(cells) >= 2:
+            lines.append(f"- {cells[0]}: {cells[1]}")
+        elif cells:
+            lines.append(" ".join(cells))
     for dt in container.select("dl dt"):
         dd = dt.find_next_sibling("dd")
         k = _norm(dt.get_text(" ", strip=True))
         v = _norm(dd.get_text(" ", strip=True)) if dd else ""
-        if k or v: lines.append(f"- {k}: {v}".strip(" -:"))
+        if k or v:
+            lines.append(f"- {k}: {v}".strip(" -:"))
     return lines
 
 def extract_description(soup: BeautifulSoup) -> str:
@@ -418,7 +455,8 @@ def extract_description(soup: BeautifulSoup) -> str:
 # ---------------------------------------------------------------------------
 def extract_plz_ort(page_text: str) -> str:
     m = RE_PLZ_ORT_STRICT.search(page_text)
-    if not m: return ""
+    if not m:
+        return ""
     plz, ort = m.group(1), m.group(2)
     ort = re.split(r"[|,•·\-\–—/()]", ort)[0].strip()
     ort = re.sub(r"\s{2,}", " ", ort)
@@ -470,7 +508,7 @@ def parse_detail(detail_url: str, mode: str):
     }
 
 # ---------------------------------------------------------------------------
-# AIRTABLE HELPER
+# AIRTABLE HELPER (vollständig: list, create, update, delete, sync)
 # ---------------------------------------------------------------------------
 def airtable_table_segment():
     if AIRTABLE_TABLE_ID:
@@ -482,14 +520,30 @@ def airtable_api_url():
     if not (AIRTABLE_BASE and seg):
         raise RuntimeError(f"[Airtable] BASE oder TABLE/TABLE_ID fehlt. "
                            f"BASE='{AIRTABLE_BASE}', TABLE_ID='{AIRTABLE_TABLE_ID}', TABLE='{AIRTABLE_TABLE}'")
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{seg}"
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{seg}"
+    print(f"[Airtable] URL: {url}")
+    return url
 
 def airtable_headers():
     if not AIRTABLE_TOKEN:
         raise RuntimeError("[Airtable] AIRTABLE_TOKEN fehlt.")
     return {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
 
-def sanitize_record_for_airtable(record: dict) -> dict:
+def airtable_existing_fields():
+    url = airtable_api_url()
+    params = {"maxRecords": 1}
+    if AIRTABLE_VIEW:
+        params["view"] = AIRTABLE_VIEW
+    r = requests.get(url, headers=airtable_headers(), params=params, timeout=30)
+    if not r.ok:
+        print(f"[Airtable] Schema-Check Warnung {r.status_code}: {r.text[:400]}")
+        return set()
+    data = r.json()
+    if data.get("records"):
+        return set(data["records"][0].get("fields", {}).keys())
+    return set()
+
+def sanitize_record_for_airtable(record: dict, allowed_fields: set = None) -> dict:
     """
     NICHT anhand dynamischer 'allowed_fields' filtern – alle Keys senden (bis auf leeren Preis).
     """
@@ -508,6 +562,56 @@ def airtable_batch_create(rows):
             r.raise_for_status()
         time.sleep(0.25)
 
+def airtable_batch_update(pairs):
+    url = airtable_api_url()
+    for i in range(0, len(pairs), 10):
+        payload = {"records": pairs[i:i+10], "typecast": True}
+        r = requests.patch(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
+        if not r.ok:
+            print(f"[Airtable] Update Fehler {r.status_code}: {r.text[:800]}")
+            r.raise_for_status()
+        time.sleep(0.25)
+
+def airtable_batch_delete(ids):
+    url = airtable_api_url()
+    for i in range(0, len(ids), 10):
+        params = [("records[]", rid) for rid in ids[i:i+10]]
+        r = requests.delete(url, headers=airtable_headers(), params=params, timeout=60)
+        if not r.ok:
+            print(f"[Airtable] Delete Fehler {r.status_code}: {r.text[:800]}")
+            r.raise_for_status()
+        time.sleep(0.2)
+
+def airtable_list_all():
+    ids, fields = [], []
+    url = airtable_api_url()
+    params = {}
+    if AIRTABLE_VIEW:
+        params["view"] = AIRTABLE_VIEW
+    while True:
+        r = requests.get(url, headers=airtable_headers(), params=params, timeout=60)
+        if not r.ok:
+            raise RuntimeError(f"[Airtable] List Fehler {r.status_code}: {r.text[:400]}")
+        data = r.json()
+        for rec in data.get("records", []):
+            ids.append(rec["id"])
+            fields.append(rec.get("fields", {}))
+        offset = data.get("offset")
+        if not offset:
+            break
+        params["offset"] = offset
+        time.sleep(0.2)
+    return ids, fields
+
+def unique_key(fields: dict) -> str:
+    obj = (fields.get("Objektnummer") or "").strip()
+    if obj:
+        return f"obj:{obj}"
+    url = (fields.get("Webseite") or "").strip()
+    if url:
+        return f"url:{url}"
+    return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
+
 # ---------------------------------------------------------------------------
 # RECORD BUILDER
 # ---------------------------------------------------------------------------
@@ -525,10 +629,56 @@ def make_record(row):
     }
 
 # ---------------------------------------------------------------------------
+# SYNC (create/update/delete) je Kategorie
+# ---------------------------------------------------------------------------
+def sync_category(scraped_rows, category_label: str):
+    allowed = airtable_existing_fields()
+    print(f"[Airtable] Erkannte Beispiel-Felder: {sorted(list(allowed)) or '(keine – Tabelle evtl. leer)'}")
+
+    all_ids, all_fields = airtable_list_all()
+    existing = {}
+    for rec_id, f in zip(all_ids, all_fields):
+        if f.get("Kategorie") == category_label:
+            existing[unique_key(f)] = (rec_id, f)
+
+    desired = {}
+    for r in scraped_rows:
+        if r.get("Kategorie") == category_label:
+            k = unique_key(r)
+            desired[k] = sanitize_record_for_airtable(r, allowed)
+
+    to_create, to_update, keep = [], [], set()
+    for k, fields in desired.items():
+        if k in existing:
+            rec_id, old = existing[k]
+            diff = {fld: val for fld, val in fields.items() if old.get(fld) != val}
+            if diff:
+                to_update.append({"id": rec_id, "fields": diff})
+            keep.add(k)
+        else:
+            to_create.append(fields)
+
+    to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
+
+    print(f"[SYNC] {category_label} → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
+    if to_create:
+        airtable_batch_create(to_create)
+    if to_update:
+        airtable_batch_update(to_update)
+    if to_delete_ids:
+        airtable_batch_delete(to_delete_ids)
+
+# ---------------------------------------------------------------------------
 # HAUPTLAUF
 # ---------------------------------------------------------------------------
 def run(mode="auto"):
-    assert mode in ("kauf", "miete", "auto")
+    """
+    Modi:
+      - 'kauf'  : nur Kaufen-Sätze
+      - 'miete' : nur Mieten-Sätze
+      - 'auto'  : beide erkennen; zwei CSVs & Upserts
+    """
+    assert mode in ("kauf", "miete", "auto"), "Mode muss 'kauf', 'miete' oder 'auto' sein."
     csv_kauf  = "msi_kauf.csv"
     csv_miete = "msi_miete.csv"
 
@@ -550,10 +700,12 @@ def run(mode="auto"):
         for j, url in enumerate(new_links, 1):
             try:
                 row = parse_detail(url, mode)
-                # Skip „VERKAUFT“
+
+                # Skip, wenn Titel „verkauft“ enthält
                 if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
                     print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
                     continue
+
                 record = make_record(row)
                 all_rows.append(record)
                 print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
@@ -570,24 +722,30 @@ def run(mode="auto"):
     rows_kauf  = [r for r in all_rows if r["Kategorie"] == "Kaufen"]
     rows_miete = [r for r in all_rows if r["Kategorie"] == "Mieten"]
 
-    if mode == "kauf":  rows_miete = []
-    if mode == "miete": rows_kauf  = []
+    if mode == "kauf":
+        rows_miete = []
+    if mode == "miete":
+        rows_kauf = []
 
     cols = ["Titel","Kategorie","Webseite","Objektnummer","Beschreibung","Bild","Preis","Standort"]
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows_kauf)
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(rows_kauf)
         print(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
     if rows_miete:
         with open(csv_miete, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows_miete)
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(rows_miete)
         print(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
 
-    if AIRTABLE_TOKEN and AIRTABLE_BASE and (AIRTABLE_TABLE_ID or AIRTABLE_TABLE):
+    if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
         if rows_kauf:
-            airtable_batch_create(rows_kauf)
+            sync_category(rows_kauf, "Kaufen")
         if rows_miete:
-            airtable_batch_create(rows_miete)
+            sync_category(rows_miete, "Mieten")
     else:
         print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
 
