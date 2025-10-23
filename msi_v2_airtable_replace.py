@@ -10,18 +10,12 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 BASE = "https://www.msi-hessen.de"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# GPT-Klassifikation optional (nur für Kauf-Unterkategorie-Fallback)
-USE_GPT_CLASSIFY = True
-
 # Airtable
 AIRTABLE_TOKEN    = os.getenv("AIRTABLE_TOKEN", "").strip()
 AIRTABLE_BASE     = os.getenv("AIRTABLE_BASE",  "").strip()
 AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()    # optional (Name)
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip() # bevorzugt (tbl...)
 AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()     # optional
-
-# OpenAI (optional)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
 # HTTP & HTML
@@ -500,61 +494,6 @@ def parse_detail(detail_url: str, mode: str):
     }
 
 # ---------------------------------------------------------------------------
-# Unterkategorie (Wohnung/Haus/…)
-# ---------------------------------------------------------------------------
-KEYS_WOHNUNG    = ["wohnung","etagenwohnung","eigentumswohnung","apartment","dachgeschoss","maisonette","penthouse","balkon"]
-KEYS_HAUS       = ["haus","einfamilienhaus","zweifamilienhaus","reihenhaus","doppelhaushälfte","stadtvilla","mehrfamilienhaus","dhh"]
-KEYS_GEWERBE    = ["gewerbe","büro","laden","praxis","lager","halle","gastronomie","gewerbeeinheit","gewerbefläche"]
-KEYS_KAPITAL    = ["kapitalanlage","rendite","vermietet","anlageobjekt","investment"]
-
-def heuristic_subcategory(row):
-    text = f"{row.get('Titel','')} {row.get('Description','')}".lower()
-    score = {"Wohnung":0, "Haus":0, "Gewerbe":0, "Kapitalanlage":0}
-    for k in KEYS_WOHNUNG:  score["Wohnung"]       += text.count(k)
-    for k in KEYS_HAUS:     score["Haus"]          += text.count(k)
-    for k in KEYS_GEWERBE:  score["Gewerbe"]       += text.count(k)
-    for k in KEYS_KAPITAL:  score["Kapitalanlage"] += text.count(k)
-    if score["Kapitalanlage"] >= 2: return "Kapitalanlage"
-    if score["Gewerbe"] >= 2:       return "Gewerbe"
-    if score["Haus"] >= 2 and score["Wohnung"] == 0: return "Haus"
-    if score["Wohnung"] >= 2 and score["Haus"] == 0: return "Wohnung"
-    best = max(score, key=score.get)
-    if score[best] >= 2 and list(score.values()).count(score[best]) == 1:
-        return best
-    return "Haus"
-
-def gpt_category(row):
-    if not USE_GPT_CLASSIFY or not OPENAI_API_KEY:
-        return ""
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = ("Klassifiziere dieses Immobilien-Exposé in genau eine Kategorie:\n"
-                  "Wohnung, Haus, Gewerbe, Kapitalanlage.\n"
-                  "Gib nur das Wort aus.\n\n"
-                  f"Titel: {row.get('Titel','')}\n"
-                  f"Beschreibung: {row.get('Description','')}\n")
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":"Du bist ein präziser Immobilien-Klassifizierer."},
-                      {"role":"user","content": prompt}],
-            temperature=0
-        )
-        out = (resp.choices[0].message.content or "").strip().lower()
-        mapping = {"wohnung":"Wohnung","haus":"Haus","gewerbe":"Gewerbe","kapitalanlage":"Kapitalanlage"}
-        return mapping.get(out.replace(".", "").strip(), "")
-    except Exception as e:
-        print(f"[GPT] Fehler: {e}")
-        return ""
-
-def decide_subcategory(row):
-    sub = heuristic_subcategory(row)
-    if sub: return sub
-    g = gpt_category(row)
-    if g in {"Wohnung","Haus","Gewerbe","Kapitalanlage"}: return g
-    return "Haus"
-
-# ---------------------------------------------------------------------------
 # Airtable API – Helpers
 # ---------------------------------------------------------------------------
 def airtable_table_segment():
@@ -591,9 +530,7 @@ def airtable_existing_fields():
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set) -> dict:
     """
-    WICHTIG: Nicht anhand 'allowed_fields' filtern – Airtable liefert kein festes Schema
-    über die API. Sonst würden Felder wie 'Beschreibung' droppen, wenn sie in der ersten
-    gelesenen Zeile fehlen. Wir senden einfach alle Keys (bis auf leeren Preis).
+    NICHT anhand 'allowed_fields' filtern – wir senden alle Keys (bis auf leeren Preis).
     """
     out = dict(record)
     if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
@@ -652,7 +589,7 @@ def airtable_list_all():
 # ---------------------------------------------------------------------------
 # Felder/Keys
 # ---------------------------------------------------------------------------
-def make_record(row, unterkat):
+def make_record(row):
     # Preis als Euro (OHNE ×100)
     base_num = parse_price_to_number(row["Preis"])
     preis_value = float(base_num) if base_num is not None else None
@@ -660,10 +597,9 @@ def make_record(row, unterkat):
     return {
         "Titel":           row["Titel"],
         "Kategorie":       row["KategorieDetected"],
-        "Unterkategorie":  unterkat,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
-        "Beschreibung":    row["Description"],   # jetzt zuverlässig gefüllt
+        "Beschreibung":    row["Description"],
         "Bild":            row["Bild_URL"],
         "Preis":           preis_value,
         "Standort":        row["Ort"],
@@ -680,7 +616,7 @@ def unique_key(fields: dict) -> str:
 # Upsert je Kategorie
 # ---------------------------------------------------------------------------
 def sync_category(scraped_rows, category_label: str):
-    allowed = airtable_existing_fields()  # behalten für Logging/Info
+    allowed = airtable_existing_fields()  # nur fürs Logging
     print(f"[Airtable] Erkannte Beispiel-Felder: {sorted(list(allowed)) or '(keine – Tabelle evtl. leer)'}")
 
     all_ids, all_fields = airtable_list_all()
@@ -749,8 +685,7 @@ def run(mode: str):
                     print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
                     continue
 
-                unterkat = decide_subcategory(row)
-                record = make_record(row, unterkat)
+                record = make_record(row)
                 all_rows.append(record)
 
                 print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
@@ -770,7 +705,7 @@ def run(mode: str):
     if mode == "kauf":  rows_miete = []
     if mode == "miete": rows_kauf  = []
 
-    cols = ["Titel","Kategorie","Unterkategorie","Webseite","Objektnummer","Beschreibung","Bild","Preis","Standort"]
+    cols = ["Titel","Kategorie","Webseite","Objektnummer","Beschreibung","Bild","Preis","Standort"]
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows_kauf)
