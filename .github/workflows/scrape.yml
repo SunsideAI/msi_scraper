@@ -1,15 +1,28 @@
-name: MSI Scraper
+name: Scrape MSI -> Airtable
 
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 7 * * *"   # täglich 07:00 UTC (09:00 DE)
-  workflow_dispatch:
+    - cron: "0 6 * * *"  # täglich 06:00 UTC (~07:00 MEZ)
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
+    env:
+      # 🔧 Rendering aktivieren
+      MSI_RENDER: "1"
+      MSI_RENDER_ENGINE: "playwright"
+      MSI_RENDER_TIMEOUT: "20000"
+
+      # 🔐 Airtable-Zugangsdaten (vorher unter Repo → Settings → Secrets → Actions eintragen)
+      AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+      AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
+      AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
+      AIRTABLE_VIEW: ${{ secrets.AIRTABLE_VIEW }}
+
     steps:
-      - name: Checkout Repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -17,25 +30,37 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Deps
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml openai
+          pip install requests beautifulsoup4 lxml playwright
+          python -m playwright install --with-deps chromium
 
-      - name: Run MSI Scraper (auto)
-        env:
-          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-          AIRTABLE_BASE: ${{ secrets.AIRTABLE_BASE }}
-          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
-          AIRTABLE_VIEW: ${{ secrets.AIRTABLE_VIEW }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - name: Run MSI Scraper
         run: |
+          echo "Starting scraper..."
           python msi_v2_airtable_replace.py auto
 
-      - name: Upload CSV Artefakte
+      - name: Upload CSV output
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraped-data
+          name: msi_csv
           path: |
             msi_kauf.csv
             msi_miete.csv
+
+      - name: Upload debug HTML (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug_html
+          path: debug_*.html
