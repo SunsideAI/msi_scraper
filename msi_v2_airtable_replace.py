@@ -27,9 +27,9 @@ AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip() # bevorzugt (tbl.
 AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()     # optional
 
 # Rendering ENV (optional)
-#   export MSI_RENDER=1                  -> Rendering aktivieren
-#   export MSI_RENDER_ENGINE=playwright  -> oder 'requests_html'
-#   export MSI_RENDER_TIMEOUT=20000      -> Millisekunden
+#   export MSI_RENDER=1
+#   export MSI_RENDER_ENGINE=playwright  # oder 'requests_html'
+#   export MSI_RENDER_TIMEOUT=20000
 MSI_RENDER         = os.getenv("MSI_RENDER", "0").strip() == "1"
 MSI_RENDER_ENGINE  = os.getenv("MSI_RENDER_ENGINE", "playwright").strip().lower()
 MSI_RENDER_TIMEOUT = int(os.getenv("MSI_RENDER_TIMEOUT", "20000"))
@@ -60,14 +60,7 @@ STOP_STRINGS = (
     "msi-hessen.de"
 )
 
-TAB_LABELS = {
-    "Beschreibung":   ("beschreibung",),
-    "Objektangaben":  ("objektangaben","objektdaten","daten"),
-    "Ausstattung":    ("ausstattung","merkmale"),
-    "Lage":           ("lage","lagebeschreibung","umfeld"),
-    "Energieausweis": ("energieausweis","energie","energiekennwerte"),
-}
-
+# Kontakt rausfiltern
 RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
@@ -90,7 +83,7 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
         page.set_default_timeout(timeout_ms)
         page.goto(url, wait_until="domcontentloaded")
 
-        # Warte bis Exposé/Tabs im DOM sind
+        # Tabs/Exposé im DOM?
         for sel in [".sw-yframe .sw-vframe .v-expose .v-tabs-items",
                     ".v-expose .v-tabs-items",
                     ".v-expose"]:
@@ -100,18 +93,16 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
             except Exception:
                 continue
 
-        # Sicherheit: „Beschreibung“-Tab fokussieren (falls vorhanden)
+        # „Beschreibung“-Tab aktivieren
         try:
-            tabs = page.query_selector_all(".v-tab")
-            for t in tabs:
-                label = (t.inner_text() or "").strip()
-                if "Beschreibung" in label:
+            for t in page.query_selector_all(".v-tab"):
+                if "Beschreibung" in (t.inner_text() or ""):
                     t.click()
                     break
         except Exception:
             pass
 
-        # auf Panel-Inhalt warten
+        # Auf Inhalt warten
         try:
             page.wait_for_selector(
                 ".v-expose .v-tabs-items .v-window__container #tab-0 .v-card__text p:not(.h4), "
@@ -122,7 +113,7 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
         except Exception:
             time.sleep(0.8)
 
-        # **NEU**: iFrames auslesen (screenwork/immo o.ä.)
+        # iFrames auslesen (screenwork/immo)
         try:
             for fr in page.frames:
                 fr_url = (fr.url or "").lower()
@@ -134,7 +125,6 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
         except Exception:
             pass
 
-        # networkidle hilft oft
         try:
             page.wait_for_load_state("networkidle", timeout=timeout_ms//2)
         except Exception:
@@ -146,7 +136,7 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
         return main_html, frame_htmls
 
 def _render_with_requests_html(url: str, timeout_ms: int) -> tuple[str, list[str]]:
-    """Einfacher Renderer. iFrames kann requests-html i.d.R. nicht auslesen -> nur main_html."""
+    """Einfacher Renderer (iFrames i.d.R. nicht verfügbar)."""
     from requests_html import HTMLSession
     s = HTMLSession()
     r = s.get(url, headers=HEADERS, timeout=30)
@@ -154,10 +144,7 @@ def _render_with_requests_html(url: str, timeout_ms: int) -> tuple[str, list[str
     return r.html.html, []
 
 def soup_get(url: str) -> BeautifulSoup:
-    """
-    Wenn MSI_RENDER=1 → rendern (Playwright bevorzugt) und iFrame-HTMLs in FRAME_HTMLS[url] sichern.
-    Sonst normal mit requests.
-    """
+    """Wenn MSI_RENDER=1 → rendern (Playwright bevorzugt) und iFrame-HTMLs in FRAME_HTMLS[url] sichern."""
     if not MSI_RENDER:
         return _simple_fetch(url)
 
@@ -166,23 +153,21 @@ def soup_get(url: str) -> BeautifulSoup:
             main_html, frames = _render_with_requests_html(url, MSI_RENDER_TIMEOUT)
         else:
             main_html, frames = _render_with_playwright(url, MSI_RENDER_TIMEOUT)
-        if frames:
-            FRAME_HTMLS[url] = frames
-        else:
-            FRAME_HTMLS[url] = []
+        FRAME_HTMLS[url] = frames or []
         if main_html:
             soup = BeautifulSoup(main_html, "lxml")
-            dbg_len = len(soup.get_text(" ", strip=True))
-            print(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | main_textlen={dbg_len} | frames={len(frames)}")
+            print(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | frames={len(frames)}")
             return soup
     except Exception as e:
         print(f"[RENDER] Fehler ({MSI_RENDER_ENGINE}): {e}")
 
-    # Fallback ohne Render
     print("[RENDER] Fallback: simple fetch (keine Frames)")
     FRAME_HTMLS[url] = []
     return _simple_fetch(url)
 
+# ===========================================================================
+# LISTEN / LINKS
+# ===========================================================================
 def get_list_page_urls(mode: str, max_pages: int = 50):
     first = f"{BASE}/kaufen/immobilienangebote/"
     pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
@@ -209,7 +194,7 @@ def detect_category(page_text: str) -> str:
     return "Kaufen"
 
 # ===========================================================================
-# PREIS-PARSING
+# PREIS
 # ===========================================================================
 def _normalize_numstring(s: str) -> str:
     if not s: return ""
@@ -248,84 +233,9 @@ def parse_price_to_number(label: str):
     except Exception:
         return None
 
-def _panel_from_tablink(a_tag):
-    href = (a_tag.get("href") or "").strip()
-    if href.startswith("#"):
-        panel = a_tag.find_parent().find_parent().find_next(id=href[1:])
-        if panel:
-            return panel
-    target = a_tag.get("aria-controls")
-    if target:
-        panel = a_tag.find_parent().find_parent().find_next(id=target)
-        if panel:
-            return panel
-    return None
-
-def _find_tab_navs(soup):
-    pairs = []
-    for nav in soup.select(".kt-tabs-title-list, .nav-tabs, .elementor-tabs-wrapper, ul"):
-        for a in nav.select('a[href^="#"], a[aria-controls]'):
-            label = _norm(a.get_text(" ", strip=True))
-            if not label:
-                continue
-            panel = _panel_from_tablink(a)
-            if panel:
-                pairs.append((label, panel))
-    return pairs
-
-def extract_price_from_objektangaben(soup: BeautifulSoup) -> str:
-    tab_pairs = _find_tab_navs(soup)
-    target_panel = None
-    for label, panel in tab_pairs:
-        if any(alias in label.lower() for alias in TAB_LABELS["Objektangaben"]):
-            target_panel = panel
-            break
-    if not target_panel:
-        for tbl in soup.select("table"):
-            if "kaufpreis" in tbl.get_text(" ", strip=True).lower():
-                target_panel = tbl
-                break
-    if not target_panel:
-        return ""
-    keys = ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")
-    for tr in target_panel.select("tr"):
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
-        if len(cells) >= 2 and any(k in cells[0].lower() for k in keys):
-            got = clean_price_string(cells[1])
-            if got:
-                return got
-    for dt in target_panel.select("dt"):
-        dd = dt.find_next_sibling("dd")
-        if any(k in (dt.get_text(" ", strip=True) or "").lower() for k in keys):
-            got = clean_price_string(dd.get_text(" ", strip=True) if dd else "")
-            if got:
-                return got
-    for li in target_panel.select("li"):
-        txt = li.get_text(" ", strip=True)
-        m = RE_PRICE_LINE.search(txt)
-        if m:
-            return clean_price_string(m.group(2) + " €")
-    return ""
-
-def extract_price_near_objnr(soup: BeautifulSoup) -> str:
-    obj_nodes = soup.find_all(string=re.compile(r"Objekt[-\s]?Nr", re.I))
-    for txtnode in obj_nodes:
-        container = txtnode
-        for _ in range(4):
-            if hasattr(container, "parent"):
-                container = container.parent
-        context = container.get_text(" ", strip=True)
-        m = RE_EUR_ANY.search(context)
-        if m:
-            return clean_price_string(m.group(0))
-        prev = container.previous_sibling
-        if prev and hasattr(prev, "get_text"):
-            t = prev.get_text(" ", strip=True)
-            m = RE_EUR_ANY.search(t)
-            if m:
-                return clean_price_string(m.group(0))
-    return ""
-
+# ===========================================================================
+# PREIS-EXTRAKTION (versch. Quellen)
+# ===========================================================================
 def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
     for script in soup.select('script[type="application/ld+json"]'):
         try:
@@ -383,13 +293,7 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
     return ""
 
 def extract_price_strict_top(page_text: str) -> str:
-    top = page_text
-    for stop in STOP_STRINGS:
-        pos = top.lower().find(stop.lower())
-        if pos != -1:
-            top = top[:pos]
-            break
-    euros = [e.group(0) for e in RE_EUR_ANY.finditer(top)]
+    euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
     euros_filtered = []
     for e in euros:
         mm = RE_EUR_NUMBER.search(e)
@@ -406,19 +310,9 @@ def extract_price_strict_top(page_text: str) -> str:
     return ""
 
 def extract_price(soup: BeautifulSoup, page_text: str) -> str:
-    p = extract_price_near_objnr(soup)
-    if p:
-        return p
-    p = extract_price_from_objektangaben(soup)
-    if p:
-        return p
     p = extract_price_from_jsonld(soup)
     if p:
         return p
-    for line in page_text.splitlines():
-        m = RE_PRICE_LINE.search(line.strip())
-        if m:
-            return clean_price_string(m.group(2) + " €")
     p = extract_price_dom(soup)
     if p:
         return p
@@ -508,14 +402,10 @@ def extract_description(soup: BeautifulSoup) -> str:
     return ""
 
 def get_description(detail_url: str, main_soup: BeautifulSoup) -> str:
-    """
-    Erst Haupt-DOM versuchen; wenn leer und wir haben iFrame-HTMLs,
-    versuche nacheinander in allen iFrame-DOMs.
-    """
+    """Erst Haupt-DOM, dann alle iFrame-DOMs durchprobieren."""
     desc = extract_description(main_soup)
     if desc:
         return desc
-
     frames = FRAME_HTMLS.get(detail_url) or []
     for html in frames:
         try:
@@ -546,7 +436,7 @@ def parse_detail(detail_url: str, mode: str):
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
-    # *** WICHTIG: Beschreibung über Haupt- und iFrame-DOMs holen ***
+    # **WICHTIG: Beschreibung über Haupt- und iFrame-DOMs holen**
     description = get_description(detail_url, soup)
 
     m_obj = RE_OBJEKTNR.search(page_text)
@@ -765,12 +655,17 @@ def run(mode="auto"):
             print(f"[WARN] Abbruch beim Lesen der Liste: {list_url} -> {e}")
             break
 
-        new_links = [u for u in detail_links if u not in seen]
-        if idx > 1 and not new_links:
-            print(f"[INFO] Keine neuen Links auf Seite {idx} – Stop.")
+        if not detail_links:
+            print(f"[INFO] Keine Einträge auf Seite {idx} – Stop.")
             break
+
+        new_links = [u for u in detail_links if u not in seen]
         seen.update(new_links)
-        print(f"[Seite {idx}] {len(new_links)} neue Detailseiten")
+        if not new_links:
+            print(f"[INFO] Seite {idx}: keine neuen Links – weiter.")
+            continue
+
+        print(f"[{mode.upper()}] Seite {idx}: {len(new_links)} Exposés")
 
         for j, url in enumerate(new_links, 1):
             try:
@@ -784,16 +679,17 @@ def run(mode="auto"):
                 record = make_record(row)
                 all_rows.append(record)
                 print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]}")
-                time.sleep(0.15)
+                time.sleep(0.1)
             except Exception as e:
                 print(f"    [FEHLER] {url} -> {e}")
                 continue
-        time.sleep(0.25)
+        time.sleep(0.2)
 
     if not all_rows:
         print("[WARN] Keine Datensätze gefunden.")
         return
 
+    # Split nur zur CSV-Erzeugung nach Kategorie
     rows_kauf  = [r for r in all_rows if r["Kategorie"] == "Kaufen"]
     rows_miete = [r for r in all_rows if r["Kategorie"] == "Mieten"]
 
@@ -826,5 +722,5 @@ def run(mode="auto"):
 
 # ===========================================================================
 if __name__ == "__main__":
-    mode = (sys.argv[1].strip().lower() if len(sys.argv) > 1 else "auto")
+    mode = (sys.argv[1].strip().lower() if len(sys.argv) > 1 else "kauf")
     run(mode)
