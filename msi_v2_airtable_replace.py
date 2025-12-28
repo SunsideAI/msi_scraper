@@ -26,6 +26,9 @@ AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()    # optional (Name)
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip() # bevorzugt (tbl...)
 AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()     # optional
 
+# OpenAI für Kurzbeschreibung
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
 # Rendering ENV (optional)
 #   export MSI_RENDER=1
 #   export MSI_RENDER_ENGINE=playwright  # oder 'requests_html'
@@ -95,7 +98,7 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
             except Exception:
                 continue
 
-        # „Beschreibung“-Tab aktivieren
+        # „Beschreibung"-Tab aktivieren
         try:
             for t in page.query_selector_all(".v-tab"):
                 if "Beschreibung" in (t.inner_text() or ""):
@@ -484,6 +487,298 @@ def get_description(detail_url: str, main_soup: BeautifulSoup) -> str:
     return ""
 
 # ===========================================================================
+# ZUSÄTZLICHE DATEN EXTRAKTION
+# ===========================================================================
+def extract_additional_data(page_text: str) -> dict:
+    """Extrahiere zusätzliche Daten für die Kurzbeschreibung"""
+    data = {
+        "zimmer": "",
+        "wohnflaeche": "",
+        "grundstueck": "",
+        "baujahr": ""
+    }
+    
+    # Zimmer extrahieren
+    zimmer_patterns = [
+        r"(\d+)\s*Zimmer",
+        r"Zimmer[:\s]+(\d+)",
+        r"(\d+)-Zimmer",
+    ]
+    for pattern in zimmer_patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            data["zimmer"] = m.group(1)
+            break
+    
+    # Wohnfläche extrahieren
+    wohnflaeche_patterns = [
+        r"(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*Wohnfläche",
+        r"Wohnfläche[:\s]+(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²",
+        r"(\d+(?:[.,]\d+)?)\s*m²\s*Wohnfl",
+    ]
+    for pattern in wohnflaeche_patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            data["wohnflaeche"] = m.group(1).replace(",", ".")
+            break
+    
+    # Grundstück extrahieren
+    grundstueck_patterns = [
+        r"(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*Grundstück",
+        r"Grundstück[:\s]+(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²",
+        r"(\d+(?:[.,]\d+)?)\s*m²\s*(?:großes?\s+)?Grundstück",
+    ]
+    for pattern in grundstueck_patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            data["grundstueck"] = m.group(1).replace(",", ".")
+            break
+    
+    # Baujahr extrahieren
+    baujahr_patterns = [
+        r"Baujahr[:\s]+(\d{4})",
+        r"aus\s+(?:dem\s+)?(?:Baujahr\s+)?(\d{4})",
+        r"(\d{4})\s+(?:erbaut|gebaut)",
+    ]
+    for pattern in baujahr_patterns:
+        m = re.search(pattern, page_text, re.IGNORECASE)
+        if m:
+            jahr = int(m.group(1))
+            if 1800 <= jahr <= 2030:
+                data["baujahr"] = str(jahr)
+                break
+    
+    return data
+
+# ===========================================================================
+# GPT KURZBESCHREIBUNG MIT CACHING
+# ===========================================================================
+
+# Cache für existierende Kurzbeschreibungen (wird beim Start gefüllt)
+KURZBESCHREIBUNG_CACHE = {}  # {objektnummer: kurzbeschreibung}
+
+def load_kurzbeschreibung_cache():
+    """Lädt existierende Kurzbeschreibungen aus Airtable in den Cache"""
+    global KURZBESCHREIBUNG_CACHE
+    
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
+        print("[CACHE] Airtable nicht konfiguriert - Cache leer")
+        return
+    
+    try:
+        all_ids, all_fields = airtable_list_all()
+        for fields in all_fields:
+            obj_nr = fields.get("Objektnummer", "").strip()
+            kurzbeschreibung = fields.get("Kurzbeschreibung", "").strip()
+            if obj_nr and kurzbeschreibung:
+                KURZBESCHREIBUNG_CACHE[obj_nr] = kurzbeschreibung
+        
+        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen aus Airtable geladen")
+    except Exception as e:
+        print(f"[CACHE] Fehler beim Laden: {e}")
+
+def get_cached_kurzbeschreibung(objektnummer: str) -> str:
+    """Holt Kurzbeschreibung aus Cache wenn vorhanden"""
+    return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
+
+# Einheitliche Feldstruktur für Kurzbeschreibung
+KURZBESCHREIBUNG_FIELDS = [
+    "Objekttyp",
+    "Zimmer", 
+    "Schlafzimmer",
+    "Wohnfläche",
+    "Grundstück",
+    "Baujahr",
+    "Kategorie",
+    "Preis",
+    "Standort",
+    "Energieeffizienz",
+    "Besonderheiten"
+]
+
+def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
+    """
+    Normalisiert die GPT-Ausgabe und füllt fehlende Felder mit Scrape-Daten oder '-'.
+    Stellt einheitliche Struktur sicher.
+    """
+    # Parse GPT Output in Dictionary
+    parsed = {}
+    for line in gpt_output.strip().split("\n"):
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if value and value != "-":
+                parsed[key] = value
+    
+    # Mapping von Scrape-Feldern zu Kurzbeschreibung-Feldern
+    scrape_mapping = {
+        "Zimmer": "zimmer",
+        "Wohnfläche": "wohnflaeche", 
+        "Grundstück": "grundstueck",
+        "Baujahr": "baujahr",
+        "Kategorie": "kategorie",
+        "Preis": "preis",
+        "Standort": "standort",
+    }
+    
+    # Fülle fehlende Felder aus Scrape-Daten
+    for field, scrape_key in scrape_mapping.items():
+        if field not in parsed or not parsed[field] or parsed[field] == "-":
+            scrape_value = scraped_data.get(scrape_key, "")
+            if scrape_value:
+                # Formatiere Preis
+                if field == "Preis" and scrape_value:
+                    try:
+                        preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
+                        parsed[field] = f"{int(preis_num):,} €".replace(",", ".")
+                    except:
+                        parsed[field] = str(scrape_value)
+                # Formatiere Wohnfläche
+                elif field == "Wohnfläche" and scrape_value:
+                    if "m²" not in str(scrape_value):
+                        parsed[field] = f"{scrape_value} m²"
+                    else:
+                        parsed[field] = str(scrape_value)
+                # Formatiere Grundstück
+                elif field == "Grundstück" and scrape_value:
+                    if "m²" not in str(scrape_value):
+                        parsed[field] = f"{scrape_value} m²"
+                    else:
+                        parsed[field] = str(scrape_value)
+                else:
+                    parsed[field] = str(scrape_value)
+    
+    # Baue einheitliche Ausgabe mit allen Feldern
+    output_lines = []
+    for field in KURZBESCHREIBUNG_FIELDS:
+        value = parsed.get(field, "-")
+        if not value or value.strip() == "":
+            value = "-"
+        output_lines.append(f"{field}: {value}")
+    
+    return "\n".join(output_lines)
+
+def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
+                               zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
+                               objektnummer: str = "") -> str:
+    """
+    Generiert eine strukturierte Kurzbeschreibung mit GPT für die KI-Suche.
+    Format ist optimiert für Regex/KI-Matching im Chatbot.
+    Fehlende Felder werden aus Scrape-Daten ergänzt oder mit '-' gefüllt.
+    
+    OPTIMIERUNG: Wenn bereits eine Kurzbeschreibung in Airtable existiert, wird diese verwendet.
+    """
+    
+    # CACHE CHECK: Wenn bereits vorhanden, nicht neu generieren!
+    if objektnummer:
+        cached = get_cached_kurzbeschreibung(objektnummer)
+        if cached:
+            print(f"[CACHE] Kurzbeschreibung aus Cache verwendet für {objektnummer[:30]}...")
+            return cached
+    
+    # Scrape-Daten für Fallback sammeln
+    scraped_data = {
+        "kategorie": kategorie,
+        "preis": preis,
+        "standort": ort,
+        "zimmer": zimmer,
+        "wohnflaeche": wohnflaeche,
+        "grundstueck": grundstueck,
+        "baujahr": baujahr,
+    }
+    
+    if not OPENAI_API_KEY:
+        print("[WARN] OPENAI_API_KEY nicht gesetzt - erstelle Kurzbeschreibung aus Scrape-Daten")
+        # Fallback: Erstelle Kurzbeschreibung nur aus Scrape-Daten
+        return normalize_kurzbeschreibung("", scraped_data)
+    
+    # Baue zusätzliche Daten-Sektion für GPT
+    zusatz_daten = []
+    if zimmer:
+        zusatz_daten.append(f"Zimmer: {zimmer}")
+    if wohnflaeche:
+        zusatz_daten.append(f"Wohnfläche: {wohnflaeche}")
+    if grundstueck:
+        zusatz_daten.append(f"Grundstück: {grundstueck}")
+    if baujahr:
+        zusatz_daten.append(f"Baujahr: {baujahr}")
+    
+    zusatz_text = "\n".join(zusatz_daten) if zusatz_daten else "Keine zusätzlichen Daten"
+    
+    prompt = f"""Analysiere diese Immobilienanzeige und erstelle eine strukturierte Kurzbeschreibung für eine Suchfunktion.
+
+TITEL: {titel}
+KATEGORIE: {kategorie}
+PREIS: {preis if preis else 'Nicht angegeben'}
+STANDORT: {ort if ort else 'Nicht angegeben'}
+
+ZUSÄTZLICHE DATEN (aus Scraping):
+{zusatz_text}
+
+BESCHREIBUNG:
+{beschreibung[:3000]}
+
+Erstelle eine Kurzbeschreibung EXAKT in diesem Format (ALLE Felder müssen vorhanden sein, nutze "-" wenn unbekannt):
+
+Objekttyp: [Einfamilienhaus/Mehrfamilienhaus/Eigentumswohnung/Baugrundstück/Reihenhaus/Doppelhaushälfte/Wohnung/etc. oder "-"]
+Zimmer: [Anzahl oder "-"]
+Schlafzimmer: [Anzahl oder "-"]
+Wohnfläche: [X m² oder "-"]
+Grundstück: [X m² oder "-"]
+Baujahr: [Jahr oder "-"]
+Kategorie: [Kaufen/Mieten]
+Preis: [Preis in € oder "-"]
+Standort: [PLZ Ort oder "-"]
+Energieeffizienz: [Klasse A+ bis H oder "-"]
+Besonderheiten: [Kommaseparierte Liste oder "-"]
+
+WICHTIG: 
+- ALLE 11 Felder MÜSSEN in der Ausgabe sein
+- Nutze "-" für unbekannte/fehlende Werte
+- Nutze die ZUSÄTZLICHEN DATEN wenn die Beschreibung keine Info enthält
+- Zahlen ohne "ca." (z.B. "180 m²" statt "ca. 180 m²")
+- Preis im Format "XXX.XXX €" """
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Du bist ein Experte für Immobilienanalyse. Erstelle präzise, strukturierte Kurzbeschreibungen. Halte dich EXAKT an das vorgegebene Format."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 500,
+            "temperature": 0.1
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        gpt_output = result["choices"][0]["message"]["content"].strip()
+        
+        # Normalisiere und fülle fehlende Felder
+        kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
+        
+        print(f"[GPT] Kurzbeschreibung generiert und normalisiert ({len(kurzbeschreibung)} Zeichen)")
+        return kurzbeschreibung
+        
+    except Exception as e:
+        print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
+        # Fallback: Erstelle aus Scrape-Daten
+        return normalize_kurzbeschreibung("", scraped_data)
+
+# ===========================================================================
 # DETAIL-PARSER
 # ===========================================================================
 def extract_plz_ort(page_text: str) -> str:
@@ -529,6 +824,9 @@ def parse_detail(detail_url: str, mode: str):
 
     page_text_low = page_text.lower()
     kategorie_detected = "Mieten" if RE_MIETE.search(page_text_low) else "Kaufen"
+    
+    # Zusätzliche Daten extrahieren
+    additional_data = extract_additional_data(page_text)
 
     return {
         "Titel":        title,
@@ -539,6 +837,7 @@ def parse_detail(detail_url: str, mode: str):
         "Ort":          ort,
         "Bild_URL":     image_url,
         "KategorieDetected": kategorie_detected,
+        "AdditionalData": additional_data,
     }
 
 # ===========================================================================
@@ -578,9 +877,18 @@ def airtable_existing_fields():
     return set()
 
 def sanitize_record_for_airtable(record: dict, allowed_fields: set = None) -> dict:
+    # Felder die immer erlaubt sind (auch wenn sie in bestehenden Records leer sind)
+    ALWAYS_ALLOWED = {"Kurzbeschreibung"}
+    
     out = dict(record)
     if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
         out.pop("Preis", None)
+    
+    # Wenn allowed_fields gesetzt, filtere - aber behalte ALWAYS_ALLOWED
+    if allowed_fields:
+        all_allowed = allowed_fields | ALWAYS_ALLOWED
+        out = {k: v for k, v in out.items() if k in all_allowed}
+    
     return out
 
 def airtable_batch_create(rows):
@@ -648,15 +956,33 @@ def unique_key(fields: dict) -> str:
 # ===========================================================================
 def make_record(row):
     preis_value = parse_price_to_number(row["Preis"])
+    kategorie = row["KategorieDetected"]
+    additional = row.get("AdditionalData", {})
+    
+    # Kurzbeschreibung via GPT generieren (mit Cache-Check)
+    kurzbeschreibung = generate_kurzbeschreibung(
+        beschreibung=row["Description"],
+        titel=row["Titel"],
+        kategorie=kategorie,
+        preis=row["Preis"],
+        ort=row["Ort"],
+        zimmer=additional.get("zimmer", ""),
+        wohnflaeche=additional.get("wohnflaeche", ""),
+        grundstueck=additional.get("grundstueck", ""),
+        baujahr=additional.get("baujahr", ""),
+        objektnummer=row["Objektnummer"]
+    )
+    
     return {
-        "Titel":        row["Titel"],
-        "Kategorie":    row["KategorieDetected"],
-        "Webseite":     row["URL"],
-        "Objektnummer": row["Objektnummer"],
-        "Beschreibung": row["Description"],
-        "Bild":         row["Bild_URL"],
-        "Preis":        preis_value,
-        "Standort":     row["Ort"],
+        "Titel":           row["Titel"],
+        "Kategorie":       kategorie,
+        "Webseite":        row["URL"],
+        "Objektnummer":    row["Objektnummer"],
+        "Beschreibung":    row["Description"],
+        "Kurzbeschreibung": kurzbeschreibung,
+        "Bild":            row["Bild_URL"],
+        "Preis":           preis_value,
+        "Standort":        row["Ort"],
     }
 
 # ===========================================================================
@@ -713,6 +1039,10 @@ def run(mode="auto"):
     csv_kauf  = "msi_kauf.csv"
     csv_miete = "msi_miete.csv"
 
+    # OPTIMIERUNG: Lade existierende Kurzbeschreibungen aus Airtable
+    print("[INIT] Lade Kurzbeschreibungen-Cache aus Airtable...")
+    load_kurzbeschreibung_cache()
+
     all_rows, seen = [], set()
     for idx, list_url in enumerate(get_list_page_urls("kauf"), 1):
         try:
@@ -737,7 +1067,7 @@ def run(mode="auto"):
             try:
                 row = parse_detail(url, mode)
 
-                # Skip, wenn Titel „verkauft“ enthält
+                # Skip, wenn Titel „verkauft" enthält
                 if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
                     print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
                     continue
@@ -764,16 +1094,16 @@ def run(mode="auto"):
     if mode == "miete":
         rows_kauf = []
 
-    cols = ["Titel","Kategorie","Webseite","Objektnummer","Beschreibung","Bild","Preis","Standort"]
+    cols = ["Titel","Kategorie","Webseite","Objektnummer","Beschreibung","Kurzbeschreibung","Bild","Preis","Standort"]
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
             w.writeheader()
             w.writerows(rows_kauf)
         print(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
     if rows_miete:
         with open(csv_miete, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
             w.writeheader()
             w.writerows(rows_miete)
         print(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
