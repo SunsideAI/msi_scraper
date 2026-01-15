@@ -1,5 +1,10 @@
 # msi_v2_airtable_replace.py
 # -*- coding: utf-8 -*-
+"""
+Scraper für https://www.msi-hessen.de/
+v2.0 - Mit verbesserter GPT-Kurzbeschreibung, Unterkategorie-Caching und Validierung
+"""
+
 import sys
 import time
 import csv
@@ -22,24 +27,21 @@ HEADERS = {
 # Airtable ENV
 AIRTABLE_TOKEN    = os.getenv("AIRTABLE_TOKEN", "").strip()
 AIRTABLE_BASE     = os.getenv("AIRTABLE_BASE",  "").strip()
-AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()    # optional (Name)
-AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip() # bevorzugt (tbl...)
-AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()     # optional
+AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()
+AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip()
+AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()
 
 # OpenAI für Kurzbeschreibung
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 # Rendering ENV (optional)
-#   export MSI_RENDER=1
-#   export MSI_RENDER_ENGINE=playwright  # oder 'requests_html'
-#   export MSI_RENDER_TIMEOUT=20000
 MSI_RENDER         = os.getenv("MSI_RENDER", "0").strip() == "1"
 MSI_RENDER_ENGINE  = os.getenv("MSI_RENDER_ENGINE", "playwright").strip().lower()
 MSI_RENDER_TIMEOUT = int(os.getenv("MSI_RENDER_TIMEOUT", "20000"))
 
 print(f"[CFG] MSI_RENDER={MSI_RENDER} | ENGINE={MSI_RENDER_ENGINE} | TIMEOUT={MSI_RENDER_TIMEOUT}")
 
-# iFrame-DOMs zwischenspeichern (Haupt-URL -> [frame_html1, ...])
+# iFrame-DOMs zwischenspeichern
 FRAME_HTMLS: dict[str, list[str]] = {}
 
 # ===========================================================================
@@ -65,12 +67,26 @@ STOP_STRINGS = (
     "msi-hessen.de"
 )
 
-# Kontakt rausfiltern
 RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 # ===========================================================================
-# HTTP / HTML – immer rendern, wenn MSI_RENDER=1 (inkl. iFrames)
+# TEXT-BEREINIGUNG
+# ===========================================================================
+def clean_text(text: str) -> str:
+    """Bereinigt Text: Entfernt mehrfache Leerzeilen und unnötige Whitespaces."""
+    if not text:
+        return ""
+    text = re.sub(r'\n\s*\n+', '\n', text)
+    lines = [line.strip() for line in text.split('\n')]
+    lines = [line for line in lines if line]
+    return '\n'.join(lines)
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s{2,}", " ", (s or "").strip())
+
+# ===========================================================================
+# HTTP / HTML – immer rendern, wenn MSI_RENDER=1
 # ===========================================================================
 def _simple_fetch(url: str) -> BeautifulSoup:
     r = requests.get(url, headers=HEADERS, timeout=30)
@@ -78,7 +94,6 @@ def _simple_fetch(url: str) -> BeautifulSoup:
     return BeautifulSoup(r.text, "lxml")
 
 def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
-    """Headless-Rendering via Playwright. Liefert (main_html, [frame_htmls...])."""
     from playwright.sync_api import sync_playwright
     frame_htmls = []
     with sync_playwright() as p:
@@ -88,7 +103,6 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
         page.set_default_timeout(timeout_ms)
         page.goto(url, wait_until="domcontentloaded")
 
-        # Tabs/Exposé im DOM?
         for sel in [".sw-yframe .sw-vframe .v-expose .v-tabs-items",
                     ".v-expose .v-tabs-items",
                     ".v-expose"]:
@@ -98,7 +112,6 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
             except Exception:
                 continue
 
-        # „Beschreibung"-Tab aktivieren
         try:
             for t in page.query_selector_all(".v-tab"):
                 if "Beschreibung" in (t.inner_text() or ""):
@@ -107,7 +120,6 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
         except Exception:
             pass
 
-        # Auf Inhalt warten
         try:
             page.wait_for_selector(
                 ".v-expose .v-tabs-items .v-window__container #tab-0 .v-card__text p:not(.h4), "
@@ -118,7 +130,6 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
         except Exception:
             time.sleep(0.8)
 
-        # iFrames auslesen (screenwork/immo)
         try:
             for fr in page.frames:
                 fr_url = (fr.url or "").lower()
@@ -141,7 +152,6 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
         return main_html, frame_htmls
 
 def _render_with_requests_html(url: str, timeout_ms: int) -> tuple[str, list[str]]:
-    """Einfacher Renderer (iFrames i.d.R. nicht verfügbar)."""
     from requests_html import HTMLSession
     s = HTMLSession()
     r = s.get(url, headers=HEADERS, timeout=30)
@@ -149,7 +159,6 @@ def _render_with_requests_html(url: str, timeout_ms: int) -> tuple[str, list[str
     return r.html.html, []
 
 def soup_get(url: str) -> BeautifulSoup:
-    """Wenn MSI_RENDER=1 → rendern (Playwright bevorzugt) und iFrame-HTMLs in FRAME_HTMLS[url] sichern."""
     if not MSI_RENDER:
         return _simple_fetch(url)
 
@@ -174,7 +183,6 @@ def soup_get(url: str) -> BeautifulSoup:
 # LISTEN / LINKS
 # ===========================================================================
 def get_list_page_urls(mode: str, max_pages: int = 50):
-    """MSI listet Kauf & Miete gemeinsam unter /kaufen/immobilienangebote/, paginiert mit /page/{n}/"""
     first = f"{BASE}/kaufen/immobilienangebote/"
     pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
     return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
@@ -191,9 +199,6 @@ def collect_detail_links(list_url: str):
 # ===========================================================================
 # UTILS
 # ===========================================================================
-def _norm(s: str) -> str:
-    return re.sub(r"\s{2,}", " ", (s or "").strip())
-
 def detect_category(page_text: str) -> str:
     if RE_MIETE.search(page_text): return "Mieten"
     if RE_KAUF.search(page_text):  return "Kaufen"
@@ -240,7 +245,7 @@ def parse_price_to_number(label: str):
         return None
 
 # ===========================================================================
-# PREIS-EXTRAKTION (versch. Quellen)
+# PREIS-EXTRAKTION
 # ===========================================================================
 def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
     for script in soup.select('script[type="application/ld+json"]'):
@@ -340,7 +345,7 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     return ""
 
 # ===========================================================================
-# BESCHREIBUNG – NUR TAB "BESCHREIBUNG"
+# BESCHREIBUNG
 # ===========================================================================
 def _clean_desc_lines(lines):
     out, seen = [], set()
@@ -364,12 +369,6 @@ def _find_expose_scope(soup: BeautifulSoup) -> Tag:
     return soup.select_one(".v-expose") or soup
 
 def extract_description(soup: BeautifulSoup) -> str:
-    """
-    Nur den Inhalt des Tabs 'Beschreibung' liefern.
-    - scope: .sw-yframe .sw-vframe .v-expose → .v-expose → soup
-    - Panel: #tab-0 → aktives .v-window-item.v-window-item--active
-    - Container: .v-card__text; sammle alle p:not(.h4) + li
-    """
     root = _find_expose_scope(soup)
 
     candidates = []
@@ -403,19 +402,16 @@ def extract_description(soup: BeautifulSoup) -> str:
 
         lines = _clean_desc_lines(lines)
         if lines:
-            return ("\n".join(lines))[:6000]
+            return clean_text("\n".join(lines))[:6000]
 
     return ""
 
 def _find_screenwork_links(soup: BeautifulSoup) -> list[str]:
-    """Sucht direkte Links/iframes auf Screenwork/Immo-Exposés."""
     urls = set()
-    # iframes
     for ifr in soup.select("iframe[src]"):
         src = (ifr.get("src") or "").strip()
         if any(host in src for host in ("screenwork", "immo")):
             urls.add(src)
-    # anchor links
     for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
         if any(host in href for host in ("screenwork", "immo")):
@@ -423,24 +419,15 @@ def _find_screenwork_links(soup: BeautifulSoup) -> list[str]:
     return list(urls)
 
 def get_description(detail_url: str, main_soup: BeautifulSoup) -> str:
-    """
-    Priorität:
-      1) Haupt-DOM (gerendert)
-      2) alle gerenderten iFrames (FRAME_HTMLS)
-      3) DIREKTER Abruf verlinkter screenwork/immo-HTML-Seiten (ohne Rendering)
-    """
-    # 1) Haupt-DOM
     desc = extract_description(main_soup)
     if desc:
         return desc
 
-    # Objekt-ID für Debug
     obj = ""
     m = RE_OBJEKTNR.search(main_soup.get_text(" ", strip=True))
     if m:
         obj = m.group(1)
 
-    # 2) iFrames aus dem Renderer
     frames = FRAME_HTMLS.get(detail_url) or []
     if frames:
         for i, html in enumerate(frames):
@@ -451,15 +438,7 @@ def get_description(detail_url: str, main_soup: BeautifulSoup) -> str:
                     return desc
             except Exception:
                 pass
-        # wenn nichts gefunden: Debug dumpen (nur erster Frame, um Artefakte klein zu halten)
-        try:
-            with open(f"debug_{obj or 'na'}_frame0.html", "w", encoding="utf-8") as f:
-                f.write(frames[0])
-            print(f"[DEBUG] wrote debug_{obj or 'na'}_frame0.html")
-        except Exception:
-            pass
 
-    # 3) Direkte screenwork/immo-HTMLs (per requests)
     try:
         for sw_url in _find_screenwork_links(main_soup):
             try:
@@ -476,21 +455,12 @@ def get_description(detail_url: str, main_soup: BeautifulSoup) -> str:
     except Exception:
         pass
 
-    # Letzter Debug-Dump vom Haupt-DOM
-    try:
-        with open(f"debug_{obj or 'na'}_main.html", "w", encoding="utf-8") as f:
-            f.write(str(main_soup))
-        print(f"[DEBUG] wrote debug_{obj or 'na'}_main.html")
-    except Exception:
-        pass
-
     return ""
 
 # ===========================================================================
 # ZUSÄTZLICHE DATEN EXTRAKTION
 # ===========================================================================
 def extract_additional_data(page_text: str) -> dict:
-    """Extrahiere zusätzliche Daten für die Kurzbeschreibung"""
     data = {
         "zimmer": "",
         "wohnflaeche": "",
@@ -498,7 +468,6 @@ def extract_additional_data(page_text: str) -> dict:
         "baujahr": ""
     }
     
-    # Zimmer extrahieren
     zimmer_patterns = [
         r"(\d+)\s*Zimmer",
         r"Zimmer[:\s]+(\d+)",
@@ -510,7 +479,6 @@ def extract_additional_data(page_text: str) -> dict:
             data["zimmer"] = m.group(1)
             break
     
-    # Wohnfläche extrahieren
     wohnflaeche_patterns = [
         r"(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*Wohnfläche",
         r"Wohnfläche[:\s]+(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²",
@@ -522,7 +490,6 @@ def extract_additional_data(page_text: str) -> dict:
             data["wohnflaeche"] = m.group(1).replace(",", ".")
             break
     
-    # Grundstück extrahieren
     grundstueck_patterns = [
         r"(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*Grundstück",
         r"Grundstück[:\s]+(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²",
@@ -534,7 +501,6 @@ def extract_additional_data(page_text: str) -> dict:
             data["grundstueck"] = m.group(1).replace(",", ".")
             break
     
-    # Baujahr extrahieren
     baujahr_patterns = [
         r"Baujahr[:\s]+(\d{4})",
         r"aus\s+(?:dem\s+)?(?:Baujahr\s+)?(\d{4})",
@@ -551,45 +517,209 @@ def extract_additional_data(page_text: str) -> dict:
     return data
 
 # ===========================================================================
-# GPT KURZBESCHREIBUNG MIT CACHING
+# AIRTABLE FUNCTIONS
 # ===========================================================================
+def airtable_table_segment():
+    if AIRTABLE_TABLE_ID:
+        return AIRTABLE_TABLE_ID
+    return quote(AIRTABLE_TABLE, safe="") if AIRTABLE_TABLE else ""
 
-# Cache für existierende Kurzbeschreibungen (wird beim Start gefüllt)
-KURZBESCHREIBUNG_CACHE = {}  # {objektnummer: kurzbeschreibung}
+def airtable_api_url():
+    seg = airtable_table_segment()
+    if not (AIRTABLE_BASE and seg):
+        raise RuntimeError(f"[Airtable] BASE oder TABLE fehlt.")
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{seg}"
 
-def load_kurzbeschreibung_cache():
-    """Lädt existierende Kurzbeschreibungen aus Airtable in den Cache"""
-    global KURZBESCHREIBUNG_CACHE
+def airtable_headers():
+    if not AIRTABLE_TOKEN:
+        raise RuntimeError("[Airtable] AIRTABLE_TOKEN fehlt.")
+    return {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
+
+def airtable_existing_fields():
+    url = airtable_api_url()
+    params = {"maxRecords": 1}
+    if AIRTABLE_VIEW:
+        params["view"] = AIRTABLE_VIEW
+    r = requests.get(url, headers=airtable_headers(), params=params, timeout=30)
+    if not r.ok:
+        return set()
+    data = r.json()
+    if data.get("records"):
+        return set(data["records"][0].get("fields", {}).keys())
+    return set()
+
+def airtable_list_all():
+    ids, fields = [], []
+    url = airtable_api_url()
+    params = {}
+    if AIRTABLE_VIEW:
+        params["view"] = AIRTABLE_VIEW
+    while True:
+        r = requests.get(url, headers=airtable_headers(), params=params, timeout=60)
+        if not r.ok:
+            raise RuntimeError(f"[Airtable] List Fehler {r.status_code}")
+        data = r.json()
+        for rec in data.get("records", []):
+            ids.append(rec["id"])
+            fields.append(rec.get("fields", {}))
+        offset = data.get("offset")
+        if not offset:
+            break
+        params["offset"] = offset
+        time.sleep(0.2)
+    return ids, fields
+
+def airtable_batch_create(rows):
+    url = airtable_api_url()
+    for i in range(0, len(rows), 10):
+        payload = {"records": [{"fields": r} for r in rows[i:i+10]], "typecast": True}
+        r = requests.post(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
+        r.raise_for_status()
+        time.sleep(0.25)
+
+def airtable_batch_update(pairs):
+    url = airtable_api_url()
+    for i in range(0, len(pairs), 10):
+        payload = {"records": pairs[i:i+10], "typecast": True}
+        r = requests.patch(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
+        r.raise_for_status()
+        time.sleep(0.25)
+
+def airtable_batch_delete(ids):
+    url = airtable_api_url()
+    for i in range(0, len(ids), 10):
+        params = [("records[]", rid) for rid in ids[i:i+10]]
+        r = requests.delete(url, headers=airtable_headers(), params=params, timeout=60)
+        r.raise_for_status()
+        time.sleep(0.2)
+
+def sanitize_record_for_airtable(record: dict, allowed_fields: set = None) -> dict:
+    ALWAYS_ALLOWED = {"Kurzbeschreibung"}
+    out = dict(record)
+    if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
+        out.pop("Preis", None)
+    if allowed_fields:
+        all_allowed = allowed_fields | ALWAYS_ALLOWED
+        out = {k: v for k, v in out.items() if k in all_allowed}
+    return out
+
+def unique_key(fields: dict) -> str:
+    obj = (fields.get("Objektnummer") or "").strip()
+    if obj:
+        return f"obj:{obj}"
+    url = (fields.get("Webseite") or "").strip()
+    if url:
+        return f"url:{url}"
+    return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
+
+# ===========================================================================
+# VALIDIERUNG
+# ===========================================================================
+def is_valid_record(record: dict) -> bool:
+    titel = (record.get("Titel") or "").strip()
+    webseite = (record.get("Webseite") or "").strip()
+    
+    if not titel or not webseite:
+        return False
+    
+    filled_fields = 0
+    for key, value in record.items():
+        if value is not None:
+            if isinstance(value, str) and value.strip():
+                filled_fields += 1
+            elif isinstance(value, (int, float)) and value > 0:
+                filled_fields += 1
+    
+    return filled_fields >= 3
+
+def filter_valid_records(records: list) -> list:
+    valid = []
+    invalid_count = 0
+    
+    for record in records:
+        if is_valid_record(record):
+            valid.append(record)
+        else:
+            invalid_count += 1
+            print(f"[FILTER] Ungültiger Record: {record.get('Titel', 'KEIN TITEL')[:50]}")
+    
+    if invalid_count > 0:
+        print(f"[FILTER] {invalid_count} ungültige Records herausgefiltert")
+    
+    return valid
+
+def cleanup_empty_airtable_records(kategorie: str):
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
+        return
+    
+    print(f"[CLEANUP] Prüfe Airtable auf leere Records ({kategorie})...")
+    
+    try:
+        all_ids, all_fields = airtable_list_all()
+        
+        to_delete = []
+        for rec_id, fields in zip(all_ids, all_fields):
+            if fields.get("Kategorie") == kategorie and not is_valid_record(fields):
+                to_delete.append(rec_id)
+        
+        if to_delete:
+            print(f"[CLEANUP] Lösche {len(to_delete)} leere Records...")
+            airtable_batch_delete(to_delete)
+            print(f"[CLEANUP] ✅ {len(to_delete)} leere Records gelöscht")
+        else:
+            print("[CLEANUP] ✅ Keine leeren Records gefunden")
+            
+    except Exception as e:
+        print(f"[CLEANUP] Fehler: {e}")
+
+# ===========================================================================
+# CACHES - Kurzbeschreibung UND Unterkategorie
+# ===========================================================================
+KURZBESCHREIBUNG_CACHE = {}
+UNTERKATEGORIE_CACHE = {}
+
+def load_caches():
+    global KURZBESCHREIBUNG_CACHE, UNTERKATEGORIE_CACHE
     
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
-        print("[CACHE] Airtable nicht konfiguriert - Cache leer")
+        print("[CACHE] Airtable nicht konfiguriert - Caches leer")
         return
     
     try:
         all_ids, all_fields = airtable_list_all()
         for fields in all_fields:
             obj_nr = fields.get("Objektnummer", "").strip()
+            if not obj_nr:
+                continue
+            
             kurzbeschreibung = fields.get("Kurzbeschreibung", "").strip()
-            if obj_nr and kurzbeschreibung:
+            if kurzbeschreibung:
                 KURZBESCHREIBUNG_CACHE[obj_nr] = kurzbeschreibung
+            
+            unterkategorie = fields.get("Unterkategorie", "").strip()
+            if unterkategorie:
+                UNTERKATEGORIE_CACHE[obj_nr] = unterkategorie
         
-        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen aus Airtable geladen")
+        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen geladen")
+        print(f"[CACHE] {len(UNTERKATEGORIE_CACHE)} Unterkategorien geladen")
     except Exception as e:
         print(f"[CACHE] Fehler beim Laden: {e}")
 
 def get_cached_kurzbeschreibung(objektnummer: str) -> str:
-    """Holt Kurzbeschreibung aus Cache wenn vorhanden"""
     return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
 
-# Einheitliche Feldstruktur für Kurzbeschreibung
+def get_cached_unterkategorie(objektnummer: str) -> str:
+    return UNTERKATEGORIE_CACHE.get(objektnummer, "")
+
+# ===========================================================================
+# GPT KURZBESCHREIBUNG - NEUE VERSION
+# ===========================================================================
 KURZBESCHREIBUNG_FIELDS = [
     "Objekttyp",
-    "Zimmer", 
-    "Schlafzimmer",
+    "Baujahr",
     "Wohnfläche",
     "Grundstück",
-    "Baujahr",
-    "Kategorie",
+    "Zimmer",
     "Preis",
     "Standort",
     "Energieeffizienz",
@@ -597,87 +727,68 @@ KURZBESCHREIBUNG_FIELDS = [
 ]
 
 def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
-    """
-    Normalisiert die GPT-Ausgabe und füllt fehlende Felder mit Scrape-Daten oder '-'.
-    Stellt einheitliche Struktur sicher.
-    """
-    # Parse GPT Output in Dictionary
+    """Normalisiert GPT-Ausgabe. KEINE Platzhalter, nur vorhandene Felder."""
     parsed = {}
     for line in gpt_output.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
         if ":" in line:
             key, value = line.split(":", 1)
             key = key.strip()
             value = value.strip()
-            if value and value != "-":
+            if value and value not in ["-", "—", "k. A.", "unbekannt", "nicht angegeben", ""]:
                 parsed[key] = value
     
-    # Mapping von Scrape-Feldern zu Kurzbeschreibung-Feldern
     scrape_mapping = {
         "Zimmer": "zimmer",
         "Wohnfläche": "wohnflaeche", 
         "Grundstück": "grundstueck",
         "Baujahr": "baujahr",
-        "Kategorie": "kategorie",
         "Preis": "preis",
         "Standort": "standort",
     }
     
-    # Fülle fehlende Felder aus Scrape-Daten
     for field, scrape_key in scrape_mapping.items():
-        if field not in parsed or not parsed[field] or parsed[field] == "-":
+        if field not in parsed or not parsed[field]:
             scrape_value = scraped_data.get(scrape_key, "")
-            if scrape_value:
-                # Formatiere Preis
-                if field == "Preis" and scrape_value:
+            if scrape_value and str(scrape_value).strip():
+                if field == "Preis":
                     try:
                         preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
-                        parsed[field] = f"{int(preis_num):,} €".replace(",", ".")
+                        parsed[field] = f"{int(preis_num)} €"
                     except:
-                        parsed[field] = str(scrape_value)
-                # Formatiere Wohnfläche
-                elif field == "Wohnfläche" and scrape_value:
-                    if "m²" not in str(scrape_value):
-                        parsed[field] = f"{scrape_value} m²"
-                    else:
-                        parsed[field] = str(scrape_value)
-                # Formatiere Grundstück
-                elif field == "Grundstück" and scrape_value:
-                    if "m²" not in str(scrape_value):
-                        parsed[field] = f"{scrape_value} m²"
-                    else:
-                        parsed[field] = str(scrape_value)
+                        pass
+                elif field == "Wohnfläche":
+                    val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
+                    if val:
+                        parsed[field] = f"{val} m²"
+                elif field == "Grundstück":
+                    val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
+                    if val:
+                        parsed[field] = f"{val} m²"
                 else:
                     parsed[field] = str(scrape_value)
     
-    # Baue einheitliche Ausgabe mit allen Feldern
     output_lines = []
     for field in KURZBESCHREIBUNG_FIELDS:
-        value = parsed.get(field, "-")
-        if not value or value.strip() == "":
-            value = "-"
-        output_lines.append(f"{field}: {value}")
+        value = parsed.get(field, "")
+        if value and value.strip():
+            output_lines.append(f"{field}: {value}")
     
     return "\n".join(output_lines)
 
 def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
                                zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
                                objektnummer: str = "") -> str:
-    """
-    Generiert eine strukturierte Kurzbeschreibung mit GPT für die KI-Suche.
-    Format ist optimiert für Regex/KI-Matching im Chatbot.
-    Fehlende Felder werden aus Scrape-Daten ergänzt oder mit '-' gefüllt.
+    """Generiert strukturierte Kurzbeschreibung mit GPT. NEUE VERSION mit strengem Prompt."""
     
-    OPTIMIERUNG: Wenn bereits eine Kurzbeschreibung in Airtable existiert, wird diese verwendet.
-    """
-    
-    # CACHE CHECK: Wenn bereits vorhanden, nicht neu generieren!
     if objektnummer:
         cached = get_cached_kurzbeschreibung(objektnummer)
         if cached:
-            print(f"[CACHE] Kurzbeschreibung aus Cache verwendet für {objektnummer[:30]}...")
+            print(f"[CACHE] Kurzbeschreibung aus Cache für {objektnummer[:20]}...")
             return cached
     
-    # Scrape-Daten für Fallback sammeln
     scraped_data = {
         "kategorie": kategorie,
         "preis": preis,
@@ -689,56 +800,68 @@ def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, pre
     }
     
     if not OPENAI_API_KEY:
-        print("[WARN] OPENAI_API_KEY nicht gesetzt - erstelle Kurzbeschreibung aus Scrape-Daten")
-        # Fallback: Erstelle Kurzbeschreibung nur aus Scrape-Daten
         return normalize_kurzbeschreibung("", scraped_data)
     
-    # Baue zusätzliche Daten-Sektion für GPT
-    zusatz_daten = []
-    if zimmer:
-        zusatz_daten.append(f"Zimmer: {zimmer}")
-    if wohnflaeche:
-        zusatz_daten.append(f"Wohnfläche: {wohnflaeche}")
-    if grundstueck:
-        zusatz_daten.append(f"Grundstück: {grundstueck}")
-    if baujahr:
-        zusatz_daten.append(f"Baujahr: {baujahr}")
-    
-    zusatz_text = "\n".join(zusatz_daten) if zusatz_daten else "Keine zusätzlichen Daten"
-    
-    prompt = f"""Analysiere diese Immobilienanzeige und erstelle eine strukturierte Kurzbeschreibung für eine Suchfunktion.
+    # NEUER STRENGER PROMPT
+    prompt = f"""# Rolle
+Du bist ein präziser Immobilien-Datenanalyst und Parser. Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich objektive, explizit genannte Fakten zu extrahieren und streng strukturiert auszugeben. Du arbeitest regelbasiert, deterministisch und formatgenau. Kreative Ergänzungen sind untersagt.
 
+# Aufgabe
+1. Analysiere die bereitgestellte Immobilienanzeige vollständig.
+2. Extrahiere nur eindeutig genannte, objektive Fakten.
+3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
+4. Lasse jedes Feld vollständig weg, zu dem keine eindeutige Angabe vorliegt.
+
+# Eingabedaten
 TITEL: {titel}
 KATEGORIE: {kategorie}
-PREIS: {preis if preis else 'Nicht angegeben'}
-STANDORT: {ort if ort else 'Nicht angegeben'}
+PREIS: {preis if preis else 'nicht angegeben'}
+STANDORT: {ort if ort else 'nicht angegeben'}
+BESCHREIBUNG: {beschreibung[:3000]}
 
-ZUSÄTZLICHE DATEN (aus Scraping):
-{zusatz_text}
+# Erlaubte Felder (Whitelist – verbindlich)
+Es dürfen ausschließlich die folgenden Felder verwendet werden. Jedes andere Feld ist strikt verboten.
 
-BESCHREIBUNG:
-{beschreibung[:3000]}
+Objekttyp
+Baujahr
+Wohnfläche
+Grundstück
+Zimmer
+Preis
+Standort
+Energieeffizienz
+Besonderheiten
 
-Erstelle eine Kurzbeschreibung EXAKT in diesem Format (ALLE Felder müssen vorhanden sein, nutze "-" wenn unbekannt):
+# Ausgabeformat (verbindlich)
+Die Ausgabe muss exakt diesem Muster folgen. Jede Eigenschaft steht in einer eigenen Zeile. Keine Leerzeilen, keine zusätzlichen Texte, keine Markdown-Formatierung.
 
-Objekttyp: [Einfamilienhaus/Mehrfamilienhaus/Eigentumswohnung/Baugrundstück/Reihenhaus/Doppelhaushälfte/Wohnung/etc. oder "-"]
-Zimmer: [Anzahl oder "-"]
-Schlafzimmer: [Anzahl oder "-"]
-Wohnfläche: [X m² oder "-"]
-Grundstück: [X m² oder "-"]
-Baujahr: [Jahr oder "-"]
-Kategorie: [Kaufen/Mieten]
-Preis: [Preis in € oder "-"]
-Standort: [PLZ Ort oder "-"]
-Energieeffizienz: [Klasse A+ bis H oder "-"]
-Besonderheiten: [Kommaseparierte Liste oder "-"]
+Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
+Baujahr: [Jahr]
+Wohnfläche: [Zahl in m²]
+Grundstück: [Zahl in m²]
+Zimmer: [Anzahl]
+Preis: [Zahl in €]
+Standort: [Ort oder PLZ Ort]
+Energieeffizienz: [Klasse]
+Besonderheiten: [kommaseparierte Liste]
 
-WICHTIG: 
-- ALLE 11 Felder MÜSSEN in der Ausgabe sein
-- Nutze "-" für unbekannte/fehlende Werte
-- Nutze die ZUSÄTZLICHEN DATEN wenn die Beschreibung keine Info enthält
-- Zahlen ohne "ca." (z.B. "180 m²" statt "ca. 180 m²")
-- Preis im Format "XXX.XXX €" """
+# Strikte Regeln (bindend)
+• Es ist strengstens untersagt, eigene Felder zu erfinden.
+• Felder wie „Schlafzimmer", „Kategorie", „Etage", „Ausstattung", „Kauf/Miete" oder ähnliche sind ausnahmslos verboten.
+• Es dürfen keine Platzhalter verwendet werden (z. B. „-", „—", „k. A.", „unbekannt").
+• Wenn ein Feld nicht eindeutig ermittelbar ist, darf die gesamte Zeile nicht ausgegeben werden.
+• Die Reihenfolge der Zeilen muss exakt der Vorgabe entsprechen.
+• Es darf niemals mehr als ein Feld pro Zeile stehen.
+• Verwende ausschließlich arabische Ziffern.
+• Einheiten exakt wie folgt anhängen:
+  – Wohnfläche und Grundstück: m²
+  – Preis: €
+• Keine Interpretationen, keine Schätzungen, keine Ableitungen.
+• Im Zweifel gilt: lieber weniger Felder ausgeben, niemals mehr.
+• KEINE LEERZEILEN in der Ausgabe!
+
+# Ziel
+Die Ausgabe wird automatisiert weiterverarbeitet (z. B. Airtable, Voiceflow, Such- und Filterlogiken). Jede Abweichung vom Format gilt als Fehler."""
 
     try:
         headers = {
@@ -749,11 +872,11 @@ WICHTIG:
         payload = {
             "model": "gpt-4o-mini",
             "messages": [
-                {"role": "system", "content": "Du bist ein Experte für Immobilienanalyse. Erstelle präzise, strukturierte Kurzbeschreibungen. Halte dich EXAKT an das vorgegebene Format."},
+                {"role": "system", "content": "Du bist ein regelbasierter Datenparser. Halte dich strikt an die Vorgaben. Keine Kreativität, keine Ergänzungen. Keine Leerzeilen."},
                 {"role": "user", "content": prompt}
             ],
-            "max_tokens": 500,
-            "temperature": 0.1
+            "max_tokens": 400,
+            "temperature": 0.0
         }
         
         response = requests.post(
@@ -767,29 +890,115 @@ WICHTIG:
         result = response.json()
         gpt_output = result["choices"][0]["message"]["content"].strip()
         
-        # Normalisiere und fülle fehlende Felder
         kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
         
-        print(f"[GPT] Kurzbeschreibung generiert und normalisiert ({len(kurzbeschreibung)} Zeichen)")
+        print(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
         return kurzbeschreibung
         
     except Exception as e:
         print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
-        # Fallback: Erstelle aus Scrape-Daten
         return normalize_kurzbeschreibung("", scraped_data)
+
+# ===========================================================================
+# GPT UNTERKATEGORIE-KLASSIFIKATION MIT CACHING
+# ===========================================================================
+KEYS_WOHNUNG = ["wohnung", "etagenwohnung", "eigentumswohnung", "apartment", "etw", "penthouse"]
+KEYS_HAUS = ["haus", "einfamilienhaus", "zweifamilienhaus", "reihenhaus", "doppelhaushälfte", "villa", "bungalow", "efh", "dhh", "mfh"]
+KEYS_GEWERBE = ["gewerbe", "büro", "laden", "praxis", "lager", "halle", "gastronomie", "gewerbefläche"]
+KEYS_GRUNDSTUECK = ["grundstück", "baugrundstück", "bauland", "bauplatz"]
+
+def heuristic_subcategory(titel: str, beschreibung: str) -> str:
+    text = (titel + " " + beschreibung).lower()
+    
+    scores = {
+        "Grundstück": sum(1 for k in KEYS_GRUNDSTUECK if k in text),
+        "Gewerbe": sum(1 for k in KEYS_GEWERBE if k in text),
+        "Wohnung": sum(1 for k in KEYS_WOHNUNG if k in text),
+        "Haus": sum(1 for k in KEYS_HAUS if k in text),
+    }
+    
+    if scores["Grundstück"] >= 1:
+        return "Grundstück"
+    if scores["Gewerbe"] >= 2:
+        return "Gewerbe"
+    
+    best = max(scores, key=scores.get)
+    if scores[best] >= 1:
+        return best
+    
+    return "Haus"
+
+def gpt_classify_unterkategorie(titel: str, beschreibung: str, objektnummer: str) -> str:
+    """Klassifiziert die Unterkategorie via GPT. MIT CACHING."""
+    
+    if objektnummer:
+        cached = get_cached_unterkategorie(objektnummer)
+        if cached:
+            print(f"[CACHE] Unterkategorie aus Cache: {cached}")
+            return cached
+    
+    if not OPENAI_API_KEY:
+        return heuristic_subcategory(titel, beschreibung)
+    
+    allowed_cats = "Wohnung, Haus, Gewerbe, Grundstück"
+    
+    prompt = f"""Klassifiziere dieses Immobilien-Exposé in EXAKT eine der folgenden Kategorien:
+{allowed_cats}
+
+WICHTIG:
+- Gib NUR das eine Wort aus (z.B. "Wohnung" oder "Gewerbe")
+- Keine Erklärung, kein Punkt, nur das Wort
+- Bei Büro, Laden, Praxis, Lager, Halle → "Gewerbe"
+- Bei Baugrundstück, Bauland, Bauplatz → "Grundstück"
+- Bei Eigentumswohnung, ETW, Apartment → "Wohnung"
+- Bei Einfamilienhaus, DHH, Reihenhaus, Villa → "Haus"
+
+Titel: {titel}
+Beschreibung: {beschreibung[:1500]}"""
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Du bist ein präziser Immobilien-Klassifizierer. Antworte mit genau einem Wort."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 10,
+            "temperature": 0.0
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        output = result["choices"][0]["message"]["content"].strip().replace(".", "")
+        
+        valid = {"Wohnung", "Haus", "Gewerbe", "Grundstück"}
+        
+        if output in valid:
+            print(f"[GPT] Unterkategorie: {output}")
+            return output
+        else:
+            print(f"[GPT] Ungültige Kategorie '{output}', verwende Heuristik")
+            return heuristic_subcategory(titel, beschreibung)
+        
+    except Exception as e:
+        print(f"[ERROR] GPT Klassifikation fehlgeschlagen: {e}")
+        return heuristic_subcategory(titel, beschreibung)
 
 # ===========================================================================
 # DETAIL-PARSER
 # ===========================================================================
-def extract_plz_ort(page_text: str) -> str:
-    m = RE_PLZ_ORT_STRICT.search(page_text)
-    if not m:
-        return ""
-    plz, ort = m.group(1), m.group(2)
-    ort = re.split(r"[|,•·\-\–—/()]", ort)[0].strip()
-    ort = re.sub(r"\s{2,}", " ", ort)
-    return f"{plz} {ort}"
-
 def parse_detail(detail_url: str, mode: str):
     soup = soup_get(detail_url)
     page_text = soup.get_text("\n", strip=True)
@@ -797,7 +1006,6 @@ def parse_detail(detail_url: str, mode: str):
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
-    # **WICHTIG: Beschreibung über Haupt- und iFrame-/Screenwork-DOMs holen**
     description = get_description(detail_url, soup)
 
     m_obj = RE_OBJEKTNR.search(page_text)
@@ -825,7 +1033,6 @@ def parse_detail(detail_url: str, mode: str):
     page_text_low = page_text.lower()
     kategorie_detected = "Mieten" if RE_MIETE.search(page_text_low) else "Kaufen"
     
-    # Zusätzliche Daten extrahieren
     additional_data = extract_additional_data(page_text)
 
     return {
@@ -841,117 +1048,6 @@ def parse_detail(detail_url: str, mode: str):
     }
 
 # ===========================================================================
-# AIRTABLE – HELFER
-# ===========================================================================
-def airtable_table_segment():
-    if AIRTABLE_TABLE_ID:
-        return AIRTABLE_TABLE_ID
-    return quote(AIRTABLE_TABLE, safe="") if AIRTABLE_TABLE else ""
-
-def airtable_api_url():
-    seg = airtable_table_segment()
-    if not (AIRTABLE_BASE and seg):
-        raise RuntimeError(f"[Airtable] BASE oder TABLE/TABLE_ID fehlt. "
-                           f"BASE='{AIRTABLE_BASE}', TABLE_ID='{AIRTABLE_TABLE_ID}', TABLE='{AIRTABLE_TABLE}'")
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{seg}"
-    print(f"[Airtable] URL: {url}")
-    return url
-
-def airtable_headers():
-    if not AIRTABLE_TOKEN:
-        raise RuntimeError("[Airtable] AIRTABLE_TOKEN fehlt.")
-    return {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
-
-def airtable_existing_fields():
-    url = airtable_api_url()
-    params = {"maxRecords": 1}
-    if AIRTABLE_VIEW:
-        params["view"] = AIRTABLE_VIEW
-    r = requests.get(url, headers=airtable_headers(), params=params, timeout=30)
-    if not r.ok:
-        print(f"[Airtable] Schema-Check Warnung {r.status_code}: {r.text[:400]}")
-        return set()
-    data = r.json()
-    if data.get("records"):
-        return set(data["records"][0].get("fields", {}).keys())
-    return set()
-
-def sanitize_record_for_airtable(record: dict, allowed_fields: set = None) -> dict:
-    # Felder die immer erlaubt sind (auch wenn sie in bestehenden Records leer sind)
-    ALWAYS_ALLOWED = {"Kurzbeschreibung"}
-    
-    out = dict(record)
-    if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
-        out.pop("Preis", None)
-    
-    # Wenn allowed_fields gesetzt, filtere - aber behalte ALWAYS_ALLOWED
-    if allowed_fields:
-        all_allowed = allowed_fields | ALWAYS_ALLOWED
-        out = {k: v for k, v in out.items() if k in all_allowed}
-    
-    return out
-
-def airtable_batch_create(rows):
-    url = airtable_api_url()
-    for i in range(0, len(rows), 10):
-        payload = {"records": [{"fields": r} for r in rows[i:i+10]], "typecast": True}
-        r = requests.post(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
-        if not r.ok:
-            print(f"[Airtable] Create Fehler {r.status_code}: {r.text[:800]}")
-            r.raise_for_status()
-        time.sleep(0.25)
-
-def airtable_batch_update(pairs):
-    url = airtable_api_url()
-    for i in range(0, len(pairs), 10):
-        payload = {"records": pairs[i:i+10], "typecast": True}
-        r = requests.patch(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
-        if not r.ok:
-            print(f"[Airtable] Update Fehler {r.status_code}: {r.text[:800]}")
-            r.raise_for_status()
-        time.sleep(0.25)
-
-def airtable_batch_delete(ids):
-    url = airtable_api_url()
-    for i in range(0, len(ids), 10):
-        params = [("records[]", rid) for rid in ids[i:i+10]]
-        r = requests.delete(url, headers=airtable_headers(), params=params, timeout=60)
-        if not r.ok:
-            print(f"[Airtable] Delete Fehler {r.status_code}: {r.text[:800]}")
-            r.raise_for_status()
-        time.sleep(0.2)
-
-def airtable_list_all():
-    ids, fields = [], []
-    url = airtable_api_url()
-    params = {}
-    if AIRTABLE_VIEW:
-        params["view"] = AIRTABLE_VIEW
-    while True:
-        r = requests.get(url, headers=airtable_headers(), params=params, timeout=60)
-        if not r.ok:
-            raise RuntimeError(f"[Airtable] List Fehler {r.status_code}: {r.text[:400]}")
-        data = r.json()
-        for rec in data.get("records", []):
-            ids.append(rec["id"])
-            fields.append(rec.get("fields", {}))
-        offset = data.get("offset")
-        if not offset:
-            break
-        params["offset"] = offset
-        time.sleep(0.2)
-    return ids, fields
-
-def unique_key(fields: dict) -> str:
-    obj = (fields.get("Objektnummer") or "").strip()
-    if obj:
-        return f"obj:{obj}"
-    url = (fields.get("Webseite") or "").strip()
-    if url:
-        return f"url:{url}"
-    return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
-
-# ===========================================================================
 # RECORD BUILDER
 # ===========================================================================
 def make_record(row):
@@ -959,7 +1055,14 @@ def make_record(row):
     kategorie = row["KategorieDetected"]
     additional = row.get("AdditionalData", {})
     
-    # Kurzbeschreibung via GPT generieren (mit Cache-Check)
+    # Unterkategorie via GPT (mit Cache)
+    unterkategorie = gpt_classify_unterkategorie(
+        titel=row["Titel"],
+        beschreibung=row["Description"],
+        objektnummer=row["Objektnummer"]
+    )
+    
+    # Kurzbeschreibung via GPT (mit Cache)
     kurzbeschreibung = generate_kurzbeschreibung(
         beschreibung=row["Description"],
         titel=row["Titel"],
@@ -976,9 +1079,10 @@ def make_record(row):
     return {
         "Titel":           row["Titel"],
         "Kategorie":       kategorie,
+        "Unterkategorie":  unterkategorie,
         "Webseite":        row["URL"],
         "Objektnummer":    row["Objektnummer"],
-        "Beschreibung":    row["Description"],
+        "Beschreibung":    clean_text(row["Description"]),
         "Kurzbeschreibung": kurzbeschreibung,
         "Bild":            row["Bild_URL"],
         "Preis":           preis_value,
@@ -986,11 +1090,11 @@ def make_record(row):
     }
 
 # ===========================================================================
-# SYNC je Kategorie
+# SYNC
 # ===========================================================================
 def sync_category(scraped_rows, category_label: str):
     allowed = airtable_existing_fields()
-    print(f"[Airtable] Erkannte Beispiel-Felder: {sorted(list(allowed)) or '(keine – Tabelle evtl. leer)'}")
+    print(f"[Airtable] Erkannte Felder: {sorted(list(allowed)) or '(keine)'}")
 
     all_ids, all_fields = airtable_list_all()
     existing = {}
@@ -1017,7 +1121,8 @@ def sync_category(scraped_rows, category_label: str):
 
     to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
 
-    print(f"[SYNC] {category_label} → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
+    print(f"\n[SYNC] {category_label} → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
+    
     if to_create:
         airtable_batch_create(to_create)
     if to_update:
@@ -1029,19 +1134,13 @@ def sync_category(scraped_rows, category_label: str):
 # MAIN
 # ===========================================================================
 def run(mode="auto"):
-    """
-    Modi:
-      - 'kauf'  : nur Kaufen-Sätze
-      - 'miete' : nur Mieten-Sätze
-      - 'auto'  : beide erkennen; zwei CSVs & Upserts
-    """
     assert mode in ("kauf", "miete", "auto"), "Mode muss 'kauf', 'miete' oder 'auto' sein."
     csv_kauf  = "msi_kauf.csv"
     csv_miete = "msi_miete.csv"
 
-    # OPTIMIERUNG: Lade existierende Kurzbeschreibungen aus Airtable
-    print("[INIT] Lade Kurzbeschreibungen-Cache aus Airtable...")
-    load_kurzbeschreibung_cache()
+    # Lade Caches
+    print("[INIT] Lade Caches aus Airtable...")
+    load_caches()
 
     all_rows, seen = [], set()
     for idx, list_url in enumerate(get_list_page_urls("kauf"), 1):
@@ -1067,14 +1166,13 @@ def run(mode="auto"):
             try:
                 row = parse_detail(url, mode)
 
-                # Skip, wenn Titel „verkauft" enthält
                 if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
-                    print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
+                    print(f"  - {j}/{len(new_links)} SKIPPED (verkauft)")
                     continue
 
                 record = make_record(row)
                 all_rows.append(record)
-                print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:70]} | desc_len={len(record['Beschreibung'])}")
+                print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record.get('Unterkategorie', 'N/A'):12} | {record['Titel'][:50]}")
                 time.sleep(0.1)
             except Exception as e:
                 print(f"    [FEHLER] {url} -> {e}")
@@ -1085,7 +1183,14 @@ def run(mode="auto"):
         print("[WARN] Keine Datensätze gefunden.")
         return
 
-    # Split nur zur CSV-Erzeugung nach Kategorie
+    # VALIDIERUNG
+    print(f"\n[VALIDATE] Prüfe {len(all_rows)} Records...")
+    all_rows = filter_valid_records(all_rows)
+
+    if not all_rows:
+        print("[WARN] Keine gültigen Datensätze nach Filterung.")
+        return
+
     rows_kauf  = [r for r in all_rows if r["Kategorie"] == "Kaufen"]
     rows_miete = [r for r in all_rows if r["Kategorie"] == "Mieten"]
 
@@ -1094,13 +1199,15 @@ def run(mode="auto"):
     if mode == "miete":
         rows_kauf = []
 
-    cols = ["Titel","Kategorie","Webseite","Objektnummer","Beschreibung","Kurzbeschreibung","Bild","Preis","Standort"]
+    cols = ["Titel","Kategorie","Unterkategorie","Webseite","Objektnummer","Beschreibung","Kurzbeschreibung","Bild","Preis","Standort"]
+    
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
             w.writeheader()
             w.writerows(rows_kauf)
         print(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
+    
     if rows_miete:
         with open(csv_miete, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
@@ -1111,8 +1218,11 @@ def run(mode="auto"):
     if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
         if rows_kauf:
             sync_category(rows_kauf, "Kaufen")
+            cleanup_empty_airtable_records("Kaufen")
         if rows_miete:
             sync_category(rows_miete, "Mieten")
+            cleanup_empty_airtable_records("Mieten")
+        print("[Airtable] Synchronisation abgeschlossen.\n")
     else:
         print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
 
