@@ -712,7 +712,7 @@ def get_cached_unterkategorie(objektnummer: str) -> str:
     return UNTERKATEGORIE_CACHE.get(objektnummer, "")
 
 # ===========================================================================
-# GPT KURZBESCHREIBUNG - NEUE VERSION
+# GPT KURZBESCHREIBUNG - PIPE-FORMAT
 # ===========================================================================
 KURZBESCHREIBUNG_FIELDS = [
     "Objekttyp",
@@ -726,29 +726,65 @@ KURZBESCHREIBUNG_FIELDS = [
     "Besonderheiten"
 ]
 
+# Reihenfolge für Pipe-Output
+KURZBESCHREIBUNG_ORDER = [
+    "Objekttyp",
+    "Baujahr",
+    "Wohnfläche",
+    "Grundstück",
+    "Zimmer",
+    "Preis",
+    "Standort",
+    "Energieeffizienz",
+    "Besonderheiten",
+]
+
+PLATZHALTER = {"-", "—", "k. A.", "unbekannt", "nicht angegeben", "N/A", "n/a", "keine", "–", ""}
+
 def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
-    """Normalisiert GPT-Ausgabe. KEINE Platzhalter, nur vorhandene Felder."""
+    """Normalisiert GPT-Ausgabe ins Pipe-Format mit Labels. Ergänzt fehlende Werte aus Scrape-Daten."""
     parsed = {}
-    for line in gpt_output.strip().split("\n"):
+
+    # Versuche zuerst Pipe-Format zu parsen (GPT hat direkt eine Zeile geliefert)
+    for line in gpt_output.strip().splitlines():
         line = line.strip()
-        if not line:
-            continue
-        if ":" in line:
-            key, value = line.split(":", 1)
+        if "|" in line:
+            # Pipe-Zeile → Segmente parsen, Labels extrahieren
+            parts = [p.strip() for p in line.split("|")]
+            for part in parts:
+                if not part or part in PLATZHALTER:
+                    continue
+                if ":" in part:
+                    key, _, value = part.partition(":")
+                    key = key.strip()
+                    value = value.strip()
+                    if key in KURZBESCHREIBUNG_FIELDS and value and value not in PLATZHALTER:
+                        parsed[key] = value
+            if parsed:
+                break
+
+    # Falls kein Pipe-Format: altes Zeilenformat parsen
+    if not parsed:
+        for line in gpt_output.strip().split("\n"):
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            key, _, value = line.partition(":")
             key = key.strip()
             value = value.strip()
-            if value and value not in ["-", "—", "k. A.", "unbekannt", "nicht angegeben", ""]:
+            if value and value not in PLATZHALTER:
                 parsed[key] = value
-    
+
+    # Scrape-Daten ergänzen wo GPT nichts geliefert hat
     scrape_mapping = {
         "Zimmer": "zimmer",
-        "Wohnfläche": "wohnflaeche", 
+        "Wohnfläche": "wohnflaeche",
         "Grundstück": "grundstueck",
         "Baujahr": "baujahr",
         "Preis": "preis",
         "Standort": "standort",
     }
-    
+
     for field, scrape_key in scrape_mapping.items():
         if field not in parsed or not parsed[field]:
             scrape_value = scraped_data.get(scrape_key, "")
@@ -756,7 +792,7 @@ def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
                 if field == "Preis":
                     try:
                         preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
-                        parsed[field] = f"{int(preis_num)} €"
+                        parsed[field] = f"{int(preis_num):,} €".replace(",", ".")
                     except:
                         pass
                 elif field == "Wohnfläche":
@@ -767,21 +803,24 @@ def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
                     val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
                     if val:
                         parsed[field] = f"{val} m²"
+                elif field == "Zimmer":
+                    parsed[field] = str(scrape_value)
                 else:
                     parsed[field] = str(scrape_value)
-    
-    output_lines = []
-    for field in KURZBESCHREIBUNG_FIELDS:
+
+    # Pipe-Output bauen: Label: Wert, in fester Reihenfolge
+    parts = []
+    for field in KURZBESCHREIBUNG_ORDER:
         value = parsed.get(field, "")
-        if value and value.strip():
-            output_lines.append(f"{field}: {value}")
-    
-    return "\n".join(output_lines)
+        if value and value.strip() and value.strip() not in PLATZHALTER:
+            parts.append(f"{field}: {value.strip()}")
+
+    return " | ".join(parts)
 
 def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
                                zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
                                objektnummer: str = "") -> str:
-    """Generiert strukturierte Kurzbeschreibung mit GPT. NEUE VERSION mit strengem Prompt."""
+    """Generiert strukturierte Kurzbeschreibung mit GPT im Pipe-Format."""
     
     if objektnummer:
         cached = get_cached_kurzbeschreibung(objektnummer)
@@ -802,14 +841,13 @@ def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, pre
     if not OPENAI_API_KEY:
         return normalize_kurzbeschreibung("", scraped_data)
     
-    # NEUER STRENGER PROMPT
     prompt = f"""# Rolle
 Du bist ein präziser Immobilien-Datenanalyst und Parser. Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich objektive, explizit genannte Fakten zu extrahieren und streng strukturiert auszugeben. Du arbeitest regelbasiert, deterministisch und formatgenau. Kreative Ergänzungen sind untersagt.
 
 # Aufgabe
 1. Analysiere die bereitgestellte Immobilienanzeige vollständig.
 2. Extrahiere nur eindeutig genannte, objektive Fakten.
-3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
+3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Format aus.
 4. Lasse jedes Feld vollständig weg, zu dem keine eindeutige Angabe vorliegt.
 
 # Eingabedaten
@@ -820,48 +858,21 @@ STANDORT: {ort if ort else 'nicht angegeben'}
 BESCHREIBUNG: {beschreibung[:3000]}
 
 # Erlaubte Felder (Whitelist – verbindlich)
-Es dürfen ausschließlich die folgenden Felder verwendet werden. Jedes andere Feld ist strikt verboten.
-
-Objekttyp
-Baujahr
-Wohnfläche
-Grundstück
-Zimmer
-Preis
-Standort
-Energieeffizienz
-Besonderheiten
+Objekttyp, Baujahr, Wohnfläche, Grundstück, Zimmer, Preis, Standort, Energieeffizienz, Besonderheiten
 
 # Ausgabeformat (verbindlich)
-Die Ausgabe muss exakt diesem Muster folgen. Jede Eigenschaft steht in einer eigenen Zeile. Keine Leerzeilen, keine zusätzlichen Texte, keine Markdown-Formatierung.
+Gib EINE EINZIGE Zeile aus. Jedes Feld wird mit Label ausgegeben und mit " | " (Pipe mit Leerzeichen) getrennt.
 
-Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
-Baujahr: [Jahr]
-Wohnfläche: [Zahl in m²]
-Grundstück: [Zahl in m²]
-Zimmer: [Anzahl]
-Preis: [Zahl in €]
-Standort: [Ort oder PLZ Ort]
-Energieeffizienz: [Klasse]
-Besonderheiten: [kommaseparierte Liste]
+Beispiel: Objekttyp: Eigentumswohnung | Baujahr: 2015 | Wohnfläche: 85 m² | Grundstück: 350 m² | Zimmer: 3 | Preis: 515.000 € | Standort: 10115 Berlin | Energieeffizienz: B | Besonderheiten: Balkon, Aufzug, Tiefgarage
 
 # Strikte Regeln (bindend)
 • Es ist strengstens untersagt, eigene Felder zu erfinden.
-• Felder wie „Schlafzimmer", „Kategorie", „Etage", „Ausstattung", „Kauf/Miete" oder ähnliche sind ausnahmslos verboten.
-• Es dürfen keine Platzhalter verwendet werden (z. B. „-", „—", „k. A.", „unbekannt").
-• Wenn ein Feld nicht eindeutig ermittelbar ist, darf die gesamte Zeile nicht ausgegeben werden.
-• Die Reihenfolge der Zeilen muss exakt der Vorgabe entsprechen.
-• Es darf niemals mehr als ein Feld pro Zeile stehen.
+• Keine Platzhalter (z.B. "-", "—", "k. A.", "unbekannt").
+• Felder ohne eindeutige Angabe komplett weglassen – kein leeres Feld, kein doppelter Trennstrich.
+• Preise im deutschen Format mit Punkt als Tausender-Trennzeichen (z.B. 515.000 €).
 • Verwende ausschließlich arabische Ziffern.
-• Einheiten exakt wie folgt anhängen:
-  – Wohnfläche und Grundstück: m²
-  – Preis: €
-• Keine Interpretationen, keine Schätzungen, keine Ableitungen.
-• Im Zweifel gilt: lieber weniger Felder ausgeben, niemals mehr.
-• KEINE LEERZEILEN in der Ausgabe!
-
-# Ziel
-Die Ausgabe wird automatisiert weiterverarbeitet (z. B. Airtable, Voiceflow, Such- und Filterlogiken). Jede Abweichung vom Format gilt als Fehler."""
+• Einheiten: Wohnfläche und Grundstück in m², Preis in €.
+• Alles in EINER Zeile."""
 
     try:
         headers = {
@@ -872,7 +883,7 @@ Die Ausgabe wird automatisiert weiterverarbeitet (z. B. Airtable, Voiceflow, Suc
         payload = {
             "model": "gpt-4o-mini",
             "messages": [
-                {"role": "system", "content": "Du bist ein regelbasierter Datenparser. Halte dich strikt an die Vorgaben. Keine Kreativität, keine Ergänzungen. Keine Leerzeilen."},
+                {"role": "system", "content": "Du bist ein regelbasierter Datenparser. Halte dich strikt an die Vorgaben. Keine Kreativität, keine Ergänzungen. Ausgabe: EINE Zeile mit Label: Wert | Label: Wert Format."},
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": 400,
