@@ -70,6 +70,16 @@ STOP_STRINGS = (
 RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
+def truncate_at_sidebar(text: str) -> str:
+    """Schneidet page_text an der Sidebar ab (z.B. 'Neueste Immobilien'),
+    damit Preise anderer Objekte nicht in die Extraktion einfließen."""
+    min_idx = len(text)
+    for cutoff in STOP_STRINGS:
+        idx = text.find(cutoff)
+        if 0 < idx < min_idx:
+            min_idx = idx
+    return text[:min_idx]
+
 # ===========================================================================
 # TEXT-BEREINIGUNG
 # ===========================================================================
@@ -285,7 +295,10 @@ def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
     return ""
 
 def extract_price_dom(soup: BeautifulSoup) -> str:
-    for dt in soup.select("dt"):
+    # Auf den Exposé-Bereich beschränken, damit Sidebar-Preise anderer Objekte
+    # nicht irrtümlich als Preis dieses Objekts erkannt werden.
+    scope = _find_expose_scope(soup)
+    for dt in scope.select("dt"):
         label = (dt.get_text(" ", strip=True) or "").lower()
         if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
             dd = dt.find_next_sibling("dd")
@@ -293,7 +306,7 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
                 got = clean_price_string(dd.get_text(" ", strip=True))
                 if got:
                     return got
-    for tr in soup.select("table tr"):
+    for tr in scope.select("table tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2:
             label = cells[0].lower()
@@ -301,7 +314,7 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
                 got = clean_price_string(cells[1])
                 if got:
                     return got
-    for li in soup.select("li"):
+    for li in scope.select("li"):
         txt = li.get_text(" ", strip=True)
         m = RE_PRICE_LINE.search(txt)
         if m:
@@ -1043,18 +1056,21 @@ Beschreibung: {beschreibung[:1500]}"""
 def parse_detail(detail_url: str, mode: str):
     soup = soup_get(detail_url)
     page_text = soup.get_text("\n", strip=True)
+    # Sidebar ("Neueste Immobilien" u.ä.) abschneiden, damit Preise anderer
+    # Objekte nicht in Preis-Extraktion oder Kategorie-Erkennung einfließen.
+    page_text_clean = truncate_at_sidebar(page_text)
 
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
     description = get_description(detail_url, soup)
 
-    m_obj = RE_OBJEKTNR.search(page_text)
+    m_obj = RE_OBJEKTNR.search(page_text_clean)
     objektnummer = m_obj.group(1).strip() if m_obj else ""
 
-    preis_value = extract_price(soup, page_text)
+    preis_value = extract_price(soup, page_text_clean)
 
-    m_plz = RE_PLZ_ORT_STRICT.search(page_text)
+    m_plz = RE_PLZ_ORT_STRICT.search(page_text_clean)
     ort = ""
     if m_plz:
         plz, name = m_plz.group(1), m_plz.group(2)
@@ -1071,21 +1087,21 @@ def parse_detail(detail_url: str, mode: str):
         if img and img.has_attr("src"):
             image_url = urljoin(BASE, img["src"])
 
-    page_text_low = page_text.lower()
-    
+    page_text_low = page_text_clean.lower()
+
     # Kategorie-Erkennung: Kaufpreis hat Vorrang vor Miet-Keywords
     # Bei Kapitalanlagen steht oft "Kaltmiete" als Mieteinnahme auf der Seite
     has_kaufpreis = bool(re.search(r"\b(kaufpreis|zum\s*kauf)\b", page_text_low))
     has_miete = bool(RE_MIETE.search(page_text_low))
-    
+
     if has_kaufpreis:
         kategorie_detected = "Kaufen"
     elif has_miete and not has_kaufpreis:
         kategorie_detected = "Mieten"
     else:
         kategorie_detected = "Kaufen"
-    
-    additional_data = extract_additional_data(page_text)
+
+    additional_data = extract_additional_data(page_text_clean)
 
     return {
         "Titel":        title,
