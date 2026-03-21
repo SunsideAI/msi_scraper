@@ -200,8 +200,13 @@ def collect_detail_links(list_url: str):
 # UTILS
 # ===========================================================================
 def detect_category(page_text: str) -> str:
-    if RE_MIETE.search(page_text): return "Mieten"
-    if RE_KAUF.search(page_text):  return "Kaufen"
+    page_text_low = page_text.lower()
+    has_kaufpreis = bool(re.search(r"\b(kaufpreis|zum\s*kauf)\b", page_text_low))
+    has_miete = bool(RE_MIETE.search(page_text_low))
+    if has_kaufpreis:
+        return "Kaufen"
+    if has_miete:
+        return "Mieten"
     return "Kaufen"
 
 # ===========================================================================
@@ -303,6 +308,27 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
             return clean_price_string(m.group(2) + " €")
     return ""
 
+def extract_price_from_text_labels(page_text: str) -> str:
+    """Suche nach gelabelten Preisen im Text (Miete zzgl. NK, Kaufpreis, etc.)
+    Erkennt auch MSI-Format: 'Miete zzgl. NK 630 €'"""
+    patterns = [
+        # Kaufpreis (höchste Priorität)
+        re.compile(r"Kaufpreis\s+([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
+        # Kaltmiete / Nettokaltmiete
+        re.compile(r"(?:Netto)?[Kk]altmiete\s+([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
+        # Miete zzgl. NK (MSI-Format)
+        re.compile(r"Miete\s+(?:zzgl\.?\s*NK\s+)?([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
+        # Warmmiete
+        re.compile(r"Warmmiete\s+([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
+    ]
+    for pat in patterns:
+        m = pat.search(page_text)
+        if m:
+            got = clean_price_string(m.group(1) + " €")
+            if got:
+                return got
+    return ""
+
 def extract_price_strict_top(page_text: str) -> str:
     euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
     euros_filtered = []
@@ -327,21 +353,25 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     p = extract_price_dom(soup)
     if p:
         return p
+    # NEU: Gelabelte Preise aus Fließtext (inkl. Mietpreise < 10.000 €)
+    p = extract_price_from_text_labels(page_text)
+    if p:
+        return p
     p = extract_price_strict_top(page_text)
     if p:
         return p
+    # Fallback: ERSTEN Euro-Betrag nehmen (nicht max!) — erster ist meist der Objektpreis
     euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
     if euros:
-        def to_float(e):
+        for e in euros:
             mm = RE_EUR_NUMBER.search(e)
-            if not mm:
-                return 0.0
-            try:
-                return float(_normalize_numstring(mm.group(0)))
-            except:
-                return 0.0
-        best = max(euros, key=to_float)
-        return clean_price_string(best)
+            if mm:
+                try:
+                    val = float(_normalize_numstring(mm.group(0)))
+                    if val >= 50:  # Mindestens 50 €
+                        return clean_price_string(e)
+                except:
+                    continue
     return ""
 
 # ===========================================================================
@@ -1042,7 +1072,18 @@ def parse_detail(detail_url: str, mode: str):
             image_url = urljoin(BASE, img["src"])
 
     page_text_low = page_text.lower()
-    kategorie_detected = "Mieten" if RE_MIETE.search(page_text_low) else "Kaufen"
+    
+    # Kategorie-Erkennung: Kaufpreis hat Vorrang vor Miet-Keywords
+    # Bei Kapitalanlagen steht oft "Kaltmiete" als Mieteinnahme auf der Seite
+    has_kaufpreis = bool(re.search(r"\b(kaufpreis|zum\s*kauf)\b", page_text_low))
+    has_miete = bool(RE_MIETE.search(page_text_low))
+    
+    if has_kaufpreis:
+        kategorie_detected = "Kaufen"
+    elif has_miete and not has_kaufpreis:
+        kategorie_detected = "Mieten"
+    else:
+        kategorie_detected = "Kaufen"
     
     additional_data = extract_additional_data(page_text)
 
