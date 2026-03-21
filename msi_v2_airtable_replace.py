@@ -457,16 +457,20 @@ def extract_price_strict_top(page_text: str) -> str:
 def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     p = extract_price_from_jsonld(soup)
     if p:
+        _log(f"[DBG-PRICE] jsonld → {p}")
         return p
     p = extract_price_dom(soup)
     if p:
+        _log(f"[DBG-PRICE] dom → {p}")
         return p
     # NEU: Gelabelte Preise aus Fließtext (inkl. Mietpreise < 10.000 €)
     p = extract_price_from_text_labels(page_text)
     if p:
+        _log(f"[DBG-PRICE] text_labels → {p}")
         return p
     p = extract_price_strict_top(page_text)
     if p:
+        _log(f"[DBG-PRICE] strict_top → {p}")
         return p
     # Fallback: ERSTEN Euro-Betrag nehmen (nicht max!) — erster ist meist der Objektpreis
     euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
@@ -477,9 +481,13 @@ def extract_price(soup: BeautifulSoup, page_text: str) -> str:
                 try:
                     val = float(_normalize_numstring(mm.group(0)))
                     if val >= 50:  # Mindestens 50 €
+                        _log(f"[DBG-PRICE] fallback(>=50) → {clean_price_string(e)!r}  raw={e!r}")
                         return clean_price_string(e)
                 except:
                     continue
+    # Kein Preis gefunden — kurzen Textschnipsel für Diagnose ausgeben
+    snippet = page_text[:500].replace("\n", " ")
+    _log(f"[DBG-PRICE] KEIN PREIS  text_start={snippet!r}")
     return ""
 
 # ===========================================================================
