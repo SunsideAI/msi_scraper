@@ -1087,6 +1087,19 @@ def parse_detail(detail_url: str, mode: str):
     # Objekte nicht in Preis-Extraktion oder Kategorie-Erkennung einfließen.
     page_text_clean = truncate_at_sidebar(page_text)
 
+    # Inhalte aus iFrames (Playwright-Rendering) ebenfalls einbeziehen.
+    # Die Exposé-Daten (Preis, Wohnfläche, …) stecken oft im Frame-HTML.
+    frame_soups: list[BeautifulSoup] = []
+    for frame_html in FRAME_HTMLS.get(detail_url, []):
+        try:
+            fs = BeautifulSoup(frame_html, "lxml")
+            ft = truncate_at_sidebar(fs.get_text("\n", strip=True))
+            if ft.strip():
+                page_text_clean += "\n" + ft
+                frame_soups.append(fs)
+        except Exception:
+            pass
+
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
@@ -1095,7 +1108,13 @@ def parse_detail(detail_url: str, mode: str):
     m_obj = RE_OBJEKTNR.search(page_text_clean)
     objektnummer = m_obj.group(1).strip() if m_obj else ""
 
+    # Preis: erst Hauptseite, dann Frame-Soups als Fallback
     preis_value = extract_price(soup, page_text_clean)
+    if not preis_value:
+        for fs in frame_soups:
+            preis_value = extract_price(fs, "")  # page_text already merged above
+            if preis_value:
+                break
 
     m_plz = RE_PLZ_ORT_STRICT.search(page_text_clean)
     ort = ""
