@@ -395,19 +395,33 @@ def _price_from_scope(scope) -> str:
     return ""
 
 def extract_price_dom(soup: BeautifulSoup) -> str:
-    # Auf den Exposé-Bereich beschränken, damit Sidebar-Preise anderer Objekte
+    # 0) Prominenter Preis-Span direkt im Static-HTML (außerhalb Vue/x-template),
+    #    z.B. <span class="text-large font-weight-semibold">219.000&nbsp;€</span>
+    #    Dieser ist immer im DOM, unabhängig von Vue-Rendering.
+    for span in soup.select("span.text-large, span.font-weight-semibold, .immo-listing__infotext span"):
+        txt = span.get_text(" ", strip=True)
+        if "€" in txt or "EUR" in txt:
+            p = clean_price_string(txt)
+            if p:
+                v = parse_price_to_number(p)
+                if v and v >= 1000:
+                    return p
+
+    # 1) Auf den Exposé-Bereich beschränken, damit Sidebar-Preise anderer Objekte
     # nicht irrtümlich als Preis dieses Objekts erkannt werden.
     scope = _find_expose_scope(soup)
     p = _price_from_scope(scope)
     if p:
         return p
-    # Fallback: Vue-Templates (<script type="text/x-template">) direkt parsen,
+    # 2) Vue-Templates (<script type="text/x-template">) direkt parsen,
     # falls Vue beim Rendern noch nicht gemountet hat.
+    # Chrome serialisiert </ in Script-Content als <\/ — dies rückgängig machen.
     for script in soup.find_all("script", attrs={"type": "text/x-template"}):
         raw = script.string or ""
         if not raw.strip():
             continue
         try:
+            raw = raw.replace("\\/", "/")  # Chrome HTML-Serializer escapet </ → <\/
             tmpl = BeautifulSoup(raw, "lxml")
             p = _price_from_scope(tmpl)
             if p:
