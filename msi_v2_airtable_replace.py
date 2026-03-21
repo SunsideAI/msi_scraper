@@ -346,6 +346,8 @@ def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
 def _price_from_scope(scope) -> str:
     """Versucht, einen Preis aus einem BeautifulSoup-Scope zu extrahieren."""
     PRICE_KEYS = ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")
+    # Einheitenpreise (je m², pro m², /m²) nicht als Gesamtpreis werten
+    PER_UNIT = (" je ", " pro ", "/m", " per ", " qm")
     # 1) MSI-spezifisch: span.key + span.value innerhalb von <li>
     for li in scope.select("li"):
         key = li.select_one("span.key")
@@ -353,17 +355,27 @@ def _price_from_scope(scope) -> str:
         if key and val:
             label = key.get_text(" ", strip=True).rstrip(":").strip().lower()
             if any(k in label for k in PRICE_KEYS):
+                if any(u in label for u in PER_UNIT):
+                    continue  # "Kaufpreis je m²" etc. überspringen
                 got = clean_price_string(val.get_text(" ", strip=True))
                 if got:
+                    v = parse_price_to_number(got)
+                    if v is not None and v < 100:
+                        continue  # implausibel kleiner Betrag – weitersuchen
                     return got
     # 2) dt/dd
     for dt in scope.select("dt"):
         label = (dt.get_text(" ", strip=True) or "").lower()
         if any(k in label for k in PRICE_KEYS):
+            if any(u in label for u in PER_UNIT):
+                continue
             dd = dt.find_next_sibling("dd")
             if dd:
                 got = clean_price_string(dd.get_text(" ", strip=True))
                 if got:
+                    v = parse_price_to_number(got)
+                    if v is not None and v < 100:
+                        continue
                     return got
     # 3) Tabelle
     for tr in scope.select("table tr"):
