@@ -149,6 +149,7 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
             except Exception:
                 continue
 
+        # Beschreibung-Tab anklicken (erster sw-vframe: Beschreibung/Ausstattung/Lage)
         try:
             for t in page.query_selector_all(".v-tab"):
                 if "Beschreibung" in (t.inner_text() or ""):
@@ -166,6 +167,27 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
             )
         except Exception:
             time.sleep(0.8)
+
+        # Objektangaben-Tab anklicken (zweiter sw-vframe: Objektangaben/Energieausweis/Karte)
+        # → stellt sicher, dass Vuetify die expose-data <ul> in den DOM rendert.
+        try:
+            for t in page.query_selector_all(".v-tab"):
+                text = (t.inner_text() or "").strip()
+                if "Objektangaben" in text or "Angaben" in text:
+                    t.click()
+                    break
+        except Exception:
+            pass
+
+        # Auf expose-data warten, damit span.key / span.value im DOM sind
+        try:
+            page.wait_for_selector(
+                "ul.expose-data li span.key, ul.expose-data li span.value",
+                state="attached",
+                timeout=timeout_ms // 2
+            )
+        except Exception:
+            pass
 
         try:
             for fr in page.frames:
