@@ -321,26 +321,38 @@ def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
                         continue
     return ""
 
-def extract_price_dom(soup: BeautifulSoup) -> str:
-    # Auf den Exposé-Bereich beschränken, damit Sidebar-Preise anderer Objekte
-    # nicht irrtümlich als Preis dieses Objekts erkannt werden.
-    scope = _find_expose_scope(soup)
+def _price_from_scope(scope) -> str:
+    """Versucht, einen Preis aus einem BeautifulSoup-Scope zu extrahieren."""
+    PRICE_KEYS = ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")
+    # 1) MSI-spezifisch: span.key + span.value innerhalb von <li>
+    for li in scope.select("li"):
+        key = li.select_one("span.key")
+        val = li.select_one("span.value")
+        if key and val:
+            label = key.get_text(" ", strip=True).rstrip(":").strip().lower()
+            if any(k in label for k in PRICE_KEYS):
+                got = clean_price_string(val.get_text(" ", strip=True))
+                if got:
+                    return got
+    # 2) dt/dd
     for dt in scope.select("dt"):
         label = (dt.get_text(" ", strip=True) or "").lower()
-        if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
+        if any(k in label for k in PRICE_KEYS):
             dd = dt.find_next_sibling("dd")
             if dd:
                 got = clean_price_string(dd.get_text(" ", strip=True))
                 if got:
                     return got
+    # 3) Tabelle
     for tr in scope.select("table tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2:
             label = cells[0].lower()
-            if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
+            if any(k in label for k in PRICE_KEYS):
                 got = clean_price_string(cells[1])
                 if got:
                     return got
+    # 4) <li>-Text mit RE_PRICE_LINE
     for li in scope.select("li"):
         txt = li.get_text(" ", strip=True)
         m = RE_PRICE_LINE.search(txt)
@@ -348,18 +360,40 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
             return clean_price_string(m.group(2) + " €")
     return ""
 
+def extract_price_dom(soup: BeautifulSoup) -> str:
+    # Auf den Exposé-Bereich beschränken, damit Sidebar-Preise anderer Objekte
+    # nicht irrtümlich als Preis dieses Objekts erkannt werden.
+    scope = _find_expose_scope(soup)
+    p = _price_from_scope(scope)
+    if p:
+        return p
+    # Fallback: Vue-Templates (<script type="text/x-template">) direkt parsen,
+    # falls Vue beim Rendern noch nicht gemountet hat.
+    for script in soup.find_all("script", attrs={"type": "text/x-template"}):
+        raw = script.string or ""
+        if not raw.strip():
+            continue
+        try:
+            tmpl = BeautifulSoup(raw, "lxml")
+            p = _price_from_scope(tmpl)
+            if p:
+                return p
+        except Exception:
+            continue
+    return ""
+
 def extract_price_from_text_labels(page_text: str) -> str:
     """Suche nach gelabelten Preisen im Text (Miete zzgl. NK, Kaufpreis, etc.)
     Erkennt auch MSI-Format: 'Miete zzgl. NK 630 €'"""
     patterns = [
-        # Kaufpreis (höchste Priorität)
-        re.compile(r"Kaufpreis\s+([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
+        # Kaufpreis (höchste Priorität) – Doppelpunkt optional
+        re.compile(r"Kaufpreis\s*:?\s*([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
         # Kaltmiete / Nettokaltmiete
-        re.compile(r"(?:Netto)?[Kk]altmiete\s+([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
-        # Miete zzgl. NK (MSI-Format)
-        re.compile(r"Miete\s+(?:zzgl\.?\s*NK\s+)?([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
+        re.compile(r"(?:Netto)?[Kk]altmiete\s*:?\s*([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
+        # Miete zzgl. NK (MSI-Format) – Doppelpunkt nach NK optional
+        re.compile(r"Miete\s+(?:zzgl\.?\s*NK\s*:?\s*)?([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
         # Warmmiete
-        re.compile(r"Warmmiete\s+([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
+        re.compile(r"Warmmiete\s*:?\s*([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
     ]
     for pat in patterns:
         m = pat.search(page_text)
