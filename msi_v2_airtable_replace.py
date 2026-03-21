@@ -12,8 +12,35 @@ import os
 import json
 import requests
 import re
+from datetime import datetime
 from urllib.parse import quote, urljoin
 from bs4 import BeautifulSoup, Tag
+
+# ===========================================================================
+# LOGGING
+# ===========================================================================
+_RUN_START = time.monotonic()
+
+def _ts() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+def _elapsed(t0: float) -> str:
+    secs = int(time.monotonic() - t0)
+    if secs < 60:
+        return f"{secs}s"
+    return f"{secs // 60}m{secs % 60:02d}s"
+
+def _log(msg: str):
+    print(f"[{_ts()}] {msg}", flush=True)
+
+def _fmt_preis(record: dict) -> str:
+    p = record.get("Preis")
+    if p is None:
+        return "  —  "
+    try:
+        return f"{float(p):>12,.0f} €".replace(",", ".")
+    except Exception:
+        return str(p)
 
 # ===========================================================================
 # KONFIGURATION / ENV
@@ -39,7 +66,7 @@ MSI_RENDER         = os.getenv("MSI_RENDER", "0").strip() == "1"
 MSI_RENDER_ENGINE  = os.getenv("MSI_RENDER_ENGINE", "playwright").strip().lower()
 MSI_RENDER_TIMEOUT = int(os.getenv("MSI_RENDER_TIMEOUT", "20000"))
 
-print(f"[CFG] MSI_RENDER={MSI_RENDER} | ENGINE={MSI_RENDER_ENGINE} | TIMEOUT={MSI_RENDER_TIMEOUT}")
+_log(f"[CFG] MSI_RENDER={MSI_RENDER} | ENGINE={MSI_RENDER_ENGINE} | TIMEOUT={MSI_RENDER_TIMEOUT}")
 
 # iFrame-DOMs zwischenspeichern
 FRAME_HTMLS: dict[str, list[str]] = {}
@@ -69,6 +96,16 @@ STOP_STRINGS = (
 
 RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+def truncate_at_sidebar(text: str) -> str:
+    """Schneidet page_text an der Sidebar ab (z.B. 'Neueste Immobilien'),
+    damit Preise anderer Objekte nicht in die Extraktion einfließen."""
+    min_idx = len(text)
+    for cutoff in STOP_STRINGS:
+        idx = text.find(cutoff)
+        if 0 < idx < min_idx:
+            min_idx = idx
+    return text[:min_idx]
 
 # ===========================================================================
 # TEXT-BEREINIGUNG
@@ -170,12 +207,12 @@ def soup_get(url: str) -> BeautifulSoup:
         FRAME_HTMLS[url] = frames or []
         if main_html:
             soup = BeautifulSoup(main_html, "lxml")
-            print(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | frames={len(frames)}")
+            _log(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | frames={len(frames)}")
             return soup
     except Exception as e:
-        print(f"[RENDER] Fehler ({MSI_RENDER_ENGINE}): {e}")
+        _log(f"[RENDER] Fehler ({MSI_RENDER_ENGINE}): {e}")
 
-    print("[RENDER] Fallback: simple fetch (keine Frames)")
+    _log("[RENDER] Fallback: simple fetch (keine Frames)")
     FRAME_HTMLS[url] = []
     return _simple_fetch(url)
 
@@ -285,7 +322,10 @@ def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
     return ""
 
 def extract_price_dom(soup: BeautifulSoup) -> str:
-    for dt in soup.select("dt"):
+    # Auf den Exposé-Bereich beschränken, damit Sidebar-Preise anderer Objekte
+    # nicht irrtümlich als Preis dieses Objekts erkannt werden.
+    scope = _find_expose_scope(soup)
+    for dt in scope.select("dt"):
         label = (dt.get_text(" ", strip=True) or "").lower()
         if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
             dd = dt.find_next_sibling("dd")
@@ -293,7 +333,7 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
                 got = clean_price_string(dd.get_text(" ", strip=True))
                 if got:
                     return got
-    for tr in soup.select("table tr"):
+    for tr in scope.select("table tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2:
             label = cells[0].lower()
@@ -301,7 +341,7 @@ def extract_price_dom(soup: BeautifulSoup) -> str:
                 got = clean_price_string(cells[1])
                 if got:
                     return got
-    for li in soup.select("li"):
+    for li in scope.select("li"):
         txt = li.get_text(" ", strip=True)
         m = RE_PRICE_LINE.search(txt)
         if m:
@@ -671,10 +711,10 @@ def filter_valid_records(records: list) -> list:
             valid.append(record)
         else:
             invalid_count += 1
-            print(f"[FILTER] Ungültiger Record: {record.get('Titel', 'KEIN TITEL')[:50]}")
+            _log(f"[FILTER] Ungültiger Record: {record.get('Titel', 'KEIN TITEL')[:50]}")
     
     if invalid_count > 0:
-        print(f"[FILTER] {invalid_count} ungültige Records herausgefiltert")
+        _log(f"[FILTER] {invalid_count} ungültige Records herausgefiltert")
     
     return valid
 
@@ -682,7 +722,7 @@ def cleanup_empty_airtable_records(kategorie: str):
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
         return
     
-    print(f"[CLEANUP] Prüfe Airtable auf leere Records ({kategorie})...")
+    _log(f"[CLEANUP] Prüfe Airtable auf leere Records ({kategorie})...")
     
     try:
         all_ids, all_fields = airtable_list_all()
@@ -693,14 +733,14 @@ def cleanup_empty_airtable_records(kategorie: str):
                 to_delete.append(rec_id)
         
         if to_delete:
-            print(f"[CLEANUP] Lösche {len(to_delete)} leere Records...")
+            _log(f"[CLEANUP] Lösche {len(to_delete)} leere Records...")
             airtable_batch_delete(to_delete)
-            print(f"[CLEANUP] ✅ {len(to_delete)} leere Records gelöscht")
+            _log(f"[CLEANUP] ✅ {len(to_delete)} leere Records gelöscht")
         else:
-            print("[CLEANUP] ✅ Keine leeren Records gefunden")
+            _log("[CLEANUP] ✅ Keine leeren Records gefunden")
             
     except Exception as e:
-        print(f"[CLEANUP] Fehler: {e}")
+        _log(f"[CLEANUP] Fehler: {e}")
 
 # ===========================================================================
 # CACHES - Kurzbeschreibung UND Unterkategorie
@@ -712,7 +752,7 @@ def load_caches():
     global KURZBESCHREIBUNG_CACHE, UNTERKATEGORIE_CACHE
     
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
-        print("[CACHE] Airtable nicht konfiguriert - Caches leer")
+        _log("[CACHE] Airtable nicht konfiguriert - Caches leer")
         return
     
     try:
@@ -730,10 +770,10 @@ def load_caches():
             if unterkategorie:
                 UNTERKATEGORIE_CACHE[obj_nr] = unterkategorie
         
-        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen geladen")
-        print(f"[CACHE] {len(UNTERKATEGORIE_CACHE)} Unterkategorien geladen")
+        _log(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen geladen")
+        _log(f"[CACHE] {len(UNTERKATEGORIE_CACHE)} Unterkategorien geladen")
     except Exception as e:
-        print(f"[CACHE] Fehler beim Laden: {e}")
+        _log(f"[CACHE] Fehler beim Laden: {e}")
 
 def get_cached_kurzbeschreibung(objektnummer: str) -> str:
     return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
@@ -855,7 +895,7 @@ def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, pre
     if objektnummer:
         cached = get_cached_kurzbeschreibung(objektnummer)
         if cached:
-            print(f"[CACHE] Kurzbeschreibung aus Cache für {objektnummer[:20]}...")
+            _log(f"[CACHE] Kurzbeschreibung aus Cache für {objektnummer[:20]}...")
             return cached
     
     scraped_data = {
@@ -933,11 +973,11 @@ Beispiel: Objekttyp: Eigentumswohnung | Baujahr: 2015 | Wohnfläche: 85 m² | Gr
         
         kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
         
-        print(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
+        _log(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
         return kurzbeschreibung
         
     except Exception as e:
-        print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
+        _log(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
         return normalize_kurzbeschreibung("", scraped_data)
 
 # ===========================================================================
@@ -975,7 +1015,7 @@ def gpt_classify_unterkategorie(titel: str, beschreibung: str, objektnummer: str
     if objektnummer:
         cached = get_cached_unterkategorie(objektnummer)
         if cached:
-            print(f"[CACHE] Unterkategorie aus Cache: {cached}")
+            _log(f"[CACHE] Unterkategorie aus Cache: {cached}")
             return cached
     
     if not OPENAI_API_KEY:
@@ -1027,14 +1067,14 @@ Beschreibung: {beschreibung[:1500]}"""
         valid = {"Wohnung", "Haus", "Gewerbe", "Grundstück"}
         
         if output in valid:
-            print(f"[GPT] Unterkategorie: {output}")
+            _log(f"[GPT] Unterkategorie: {output}")
             return output
         else:
-            print(f"[GPT] Ungültige Kategorie '{output}', verwende Heuristik")
+            _log(f"[GPT] Ungültige Kategorie '{output}', verwende Heuristik")
             return heuristic_subcategory(titel, beschreibung)
         
     except Exception as e:
-        print(f"[ERROR] GPT Klassifikation fehlgeschlagen: {e}")
+        _log(f"[ERROR] GPT Klassifikation fehlgeschlagen: {e}")
         return heuristic_subcategory(titel, beschreibung)
 
 # ===========================================================================
@@ -1043,18 +1083,21 @@ Beschreibung: {beschreibung[:1500]}"""
 def parse_detail(detail_url: str, mode: str):
     soup = soup_get(detail_url)
     page_text = soup.get_text("\n", strip=True)
+    # Sidebar ("Neueste Immobilien" u.ä.) abschneiden, damit Preise anderer
+    # Objekte nicht in Preis-Extraktion oder Kategorie-Erkennung einfließen.
+    page_text_clean = truncate_at_sidebar(page_text)
 
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
     description = get_description(detail_url, soup)
 
-    m_obj = RE_OBJEKTNR.search(page_text)
+    m_obj = RE_OBJEKTNR.search(page_text_clean)
     objektnummer = m_obj.group(1).strip() if m_obj else ""
 
-    preis_value = extract_price(soup, page_text)
+    preis_value = extract_price(soup, page_text_clean)
 
-    m_plz = RE_PLZ_ORT_STRICT.search(page_text)
+    m_plz = RE_PLZ_ORT_STRICT.search(page_text_clean)
     ort = ""
     if m_plz:
         plz, name = m_plz.group(1), m_plz.group(2)
@@ -1071,21 +1114,21 @@ def parse_detail(detail_url: str, mode: str):
         if img and img.has_attr("src"):
             image_url = urljoin(BASE, img["src"])
 
-    page_text_low = page_text.lower()
-    
+    page_text_low = page_text_clean.lower()
+
     # Kategorie-Erkennung: Kaufpreis hat Vorrang vor Miet-Keywords
     # Bei Kapitalanlagen steht oft "Kaltmiete" als Mieteinnahme auf der Seite
     has_kaufpreis = bool(re.search(r"\b(kaufpreis|zum\s*kauf)\b", page_text_low))
     has_miete = bool(RE_MIETE.search(page_text_low))
-    
+
     if has_kaufpreis:
         kategorie_detected = "Kaufen"
     elif has_miete and not has_kaufpreis:
         kategorie_detected = "Mieten"
     else:
         kategorie_detected = "Kaufen"
-    
-    additional_data = extract_additional_data(page_text)
+
+    additional_data = extract_additional_data(page_text_clean)
 
     return {
         "Titel":        title,
@@ -1146,7 +1189,7 @@ def make_record(row):
 # ===========================================================================
 def sync_category(scraped_rows, category_label: str):
     allowed = airtable_existing_fields()
-    print(f"[Airtable] Erkannte Felder: {sorted(list(allowed)) or '(keine)'}")
+    _log(f"[Airtable] Erkannte Felder: {sorted(list(allowed)) or '(keine)'}")
 
     all_ids, all_fields = airtable_list_all()
     existing = {}
@@ -1173,7 +1216,7 @@ def sync_category(scraped_rows, category_label: str):
 
     to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
 
-    print(f"\n[SYNC] {category_label} → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
+    _log(f"[SYNC] {category_label} → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
     
     if to_create:
         airtable_batch_create(to_create)
@@ -1190,57 +1233,104 @@ def run(mode="auto"):
     csv_kauf  = "msi_kauf.csv"
     csv_miete = "msi_miete.csv"
 
+    run_t0 = time.monotonic()
+    _log(f"{'='*70}")
+    _log(f"  MSI Scraper gestartet  |  mode={mode}")
+    _log(f"{'='*70}")
+
     # Lade Caches
-    print("[INIT] Lade Caches aus Airtable...")
+    _log("[INIT] Lade Caches aus Airtable...")
     load_caches()
 
     all_rows, seen = [], set()
+    stats = {"kauf": 0, "miete": 0, "skip": 0, "fehler": 0}
+    total_n = 0  # laufende Gesamtzahl verarbeiteter Objekte
+
     for idx, list_url in enumerate(get_list_page_urls("kauf"), 1):
         try:
             detail_links = collect_detail_links(list_url)
         except Exception as e:
-            print(f"[WARN] Abbruch beim Lesen der Liste: {list_url} -> {e}")
+            _log(f"[WARN] Abbruch beim Lesen der Liste: {list_url} -> {e}")
             break
 
         if not detail_links:
-            print(f"[INFO] Keine Einträge auf Seite {idx} – Stop.")
+            _log(f"[INFO] Seite {idx}: keine Einträge – Ende der Paginierung.")
             break
 
         new_links = [u for u in detail_links if u not in seen]
         seen.update(new_links)
         if not new_links:
-            print(f"[INFO] Seite {idx}: keine neuen Links – weiter.")
+            _log(f"[INFO] Seite {idx}: alle Links bereits gesehen – weiter.")
             continue
 
-        print(f"[{mode.upper()}] Seite {idx}: {len(new_links)} Exposés")
+        page_t0 = time.monotonic()
+        _log(f"")
+        _log(f"{'─'*70}")
+        _log(f"  Seite {idx}  |  {len(new_links)} neue Exposés  |  Gesamt bisher: {total_n}")
+        _log(f"{'─'*70}")
 
         for j, url in enumerate(new_links, 1):
+            obj_t0 = time.monotonic()
             try:
                 row = parse_detail(url, mode)
 
                 if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
-                    print(f"  - {j}/{len(new_links)} SKIPPED (verkauft)")
+                    stats["skip"] += 1
+                    _log(f"  [{j:2d}/{len(new_links)}] SKIP  verkauft  {row.get('Titel','')[:55]}")
                     continue
 
                 record = make_record(row)
                 all_rows.append(record)
-                print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record.get('Unterkategorie', 'N/A'):12} | {record['Titel'][:50]}")
+                total_n += 1
+                kat = record.get("Kategorie", "?")
+                if kat == "Kaufen":
+                    stats["kauf"] += 1
+                else:
+                    stats["miete"] += 1
+
+                obj_s = f"{time.monotonic()-obj_t0:.1f}s"
+                preis = _fmt_preis(record)
+                ukat  = record.get("Unterkategorie") or "–"
+                titel = record["Titel"][:48]
+                _log(
+                    f"  [{j:2d}/{len(new_links)}] ✓  #{total_n:3d}"
+                    f"  {kat:6}  {ukat:15}  {preis}  {titel}"
+                    f"  ({obj_s})"
+                )
                 time.sleep(0.1)
             except Exception as e:
-                print(f"    [FEHLER] {url} -> {e}")
+                stats["fehler"] += 1
+                slug = url.replace("https://www.msi-hessen.de", "")
+                _log(f"  [{j:2d}/{len(new_links)}] ✗  FEHLER  {slug}  →  {e}")
                 continue
+
+        page_s = _elapsed(page_t0)
+        _log(
+            f"  Seite {idx} fertig in {page_s}"
+            f"  |  Gesamt {total_n}"
+            f"  (Kauf: {stats['kauf']}, Miete: {stats['miete']},"
+            f" Skip: {stats['skip']}, Fehler: {stats['fehler']})"
+        )
         time.sleep(0.2)
 
+    _log(f"")
+    _log(f"{'='*70}")
+    _log(f"  Scraping abgeschlossen  |  Laufzeit: {_elapsed(run_t0)}")
+    _log(f"  Gesamt: {total_n} Objekte  "
+         f"(Kauf: {stats['kauf']}, Miete: {stats['miete']},"
+         f" Skip: {stats['skip']}, Fehler: {stats['fehler']})")
+    _log(f"{'='*70}")
+
     if not all_rows:
-        print("[WARN] Keine Datensätze gefunden.")
+        _log("[WARN] Keine Datensätze gefunden.")
         return
 
     # VALIDIERUNG
-    print(f"\n[VALIDATE] Prüfe {len(all_rows)} Records...")
+    _log(f"[VALIDATE] Prüfe {len(all_rows)} Records...")
     all_rows = filter_valid_records(all_rows)
 
     if not all_rows:
-        print("[WARN] Keine gültigen Datensätze nach Filterung.")
+        _log("[WARN] Keine gültigen Datensätze nach Filterung.")
         return
 
     rows_kauf  = [r for r in all_rows if r["Kategorie"] == "Kaufen"]
@@ -1252,20 +1342,20 @@ def run(mode="auto"):
         rows_kauf = []
 
     cols = ["Titel","Kategorie","Unterkategorie","Webseite","Objektnummer","Beschreibung","Kurzbeschreibung","Bild","Preis","Standort"]
-    
+
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
             w.writeheader()
             w.writerows(rows_kauf)
-        print(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
-    
+        _log(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
+
     if rows_miete:
         with open(csv_miete, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
             w.writeheader()
             w.writerows(rows_miete)
-        print(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
+        _log(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
 
     if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
         if rows_kauf:
@@ -1274,9 +1364,9 @@ def run(mode="auto"):
         if rows_miete:
             sync_category(rows_miete, "Mieten")
             cleanup_empty_airtable_records("Mieten")
-        print("[Airtable] Synchronisation abgeschlossen.\n")
+        _log(f"[Airtable] Synchronisation abgeschlossen  |  Gesamtlaufzeit: {_elapsed(run_t0)}")
     else:
-        print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
+        _log("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
 
 # ===========================================================================
 if __name__ == "__main__":
