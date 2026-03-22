@@ -1167,6 +1167,58 @@ Beschreibung: {beschreibung[:1500]}"""
         _log(f"[ERROR] GPT Klassifikation fehlgeschlagen: {e}")
         return heuristic_subcategory(titel, beschreibung)
 
+
+def gpt_classify_kategorie(titel: str, beschreibung: str, preis: str) -> str:
+    """Klassifiziert Kaufen vs. Mieten via GPT. Gibt '' zurück wenn kein API-Key oder Fehler."""
+    if not OPENAI_API_KEY:
+        return ""
+
+    prompt = f"""Entscheide: Handelt es sich um ein KAUF- oder MIET-Angebot?
+
+Antworte mit exakt einem Wort: "Kaufen" oder "Mieten"
+Keine Erklärung, kein Punkt.
+
+Hinweise:
+- Kaufangebote nennen "Kaufpreis", "Kaufobjekt", "Eigentum", "Eigentumsübertragung"
+- Mietangebote nennen "Kaltmiete", "Warmmiete", "Monatsmiete", "zzgl. NK", "zur Miete"
+- Sehr niedrige Preise (< 5.000 €) sind fast immer Monatsmieten
+- Sehr hohe Preise (> 50.000 €) sind fast immer Kaufpreise
+
+Titel: {titel}
+Preis: {preis}
+Beschreibung: {beschreibung[:1000]}"""
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "Du bist ein präziser Immobilien-Klassifizierer. Antworte mit genau einem Wort."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 5,
+            "temperature": 0.0
+        }
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+        response.raise_for_status()
+        output = response.json()["choices"][0]["message"]["content"].strip().replace(".", "")
+        if output in {"Kaufen", "Mieten"}:
+            _log(f"[GPT] Kategorie: {output}")
+            return output
+        _log(f"[GPT] Ungültige Kategorie '{output}', behalte Keyword-Ergebnis")
+        return ""
+    except Exception as e:
+        _log(f"[ERROR] GPT Kategorie-Klassifikation fehlgeschlagen: {e}")
+        return ""
+
 # ===========================================================================
 # DETAIL-PARSER
 # ===========================================================================
@@ -1257,6 +1309,18 @@ def parse_detail(detail_url: str, mode: str):
 def make_record(row):
     preis_value = parse_price_to_number(row["Preis"])
     kategorie = row["KategorieDetected"]
+
+    # GPT override: Keyword-Ergebnis kann falsch sein wenn keine Schlüsselwörter gefunden
+    gpt_kat = gpt_classify_kategorie(
+        titel=row["Titel"],
+        beschreibung=row["Description"],
+        preis=row["Preis"],
+    )
+    if gpt_kat:
+        if gpt_kat != kategorie:
+            _log(f"[GPT] Kategorie korrigiert: {kategorie} → {gpt_kat}")
+        kategorie = gpt_kat
+
     additional = row.get("AdditionalData", {})
     
     # Unterkategorie via GPT (mit Cache)
