@@ -12,35 +12,8 @@ import os
 import json
 import requests
 import re
-from datetime import datetime
 from urllib.parse import quote, urljoin
 from bs4 import BeautifulSoup, Tag
-
-# ===========================================================================
-# LOGGING
-# ===========================================================================
-_RUN_START = time.monotonic()
-
-def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
-
-def _elapsed(t0: float) -> str:
-    secs = int(time.monotonic() - t0)
-    if secs < 60:
-        return f"{secs}s"
-    return f"{secs // 60}m{secs % 60:02d}s"
-
-def _log(msg: str):
-    print(f"[{_ts()}] {msg}", flush=True)
-
-def _fmt_preis(record: dict) -> str:
-    p = record.get("Preis")
-    if p is None:
-        return "  —  "
-    try:
-        return f"{float(p):>12,.0f} €".replace(",", ".")
-    except Exception:
-        return str(p)
 
 # ===========================================================================
 # KONFIGURATION / ENV
@@ -66,7 +39,7 @@ MSI_RENDER         = os.getenv("MSI_RENDER", "0").strip() == "1"
 MSI_RENDER_ENGINE  = os.getenv("MSI_RENDER_ENGINE", "playwright").strip().lower()
 MSI_RENDER_TIMEOUT = int(os.getenv("MSI_RENDER_TIMEOUT", "20000"))
 
-_log(f"[CFG] MSI_RENDER={MSI_RENDER} | ENGINE={MSI_RENDER_ENGINE} | TIMEOUT={MSI_RENDER_TIMEOUT}")
+print(f"[CFG] MSI_RENDER={MSI_RENDER} | ENGINE={MSI_RENDER_ENGINE} | TIMEOUT={MSI_RENDER_TIMEOUT}")
 
 # iFrame-DOMs zwischenspeichern
 FRAME_HTMLS: dict[str, list[str]] = {}
@@ -96,16 +69,6 @@ STOP_STRINGS = (
 
 RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
 RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-def truncate_at_sidebar(text: str) -> str:
-    """Schneidet page_text an der Sidebar ab (z.B. 'Neueste Immobilien'),
-    damit Preise anderer Objekte nicht in die Extraktion einfließen."""
-    min_idx = len(text)
-    for cutoff in STOP_STRINGS:
-        idx = text.find(cutoff)
-        if 0 < idx < min_idx:
-            min_idx = idx
-    return text[:min_idx]
 
 # ===========================================================================
 # TEXT-BEREINIGUNG
@@ -149,7 +112,6 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
             except Exception:
                 continue
 
-        # Beschreibung-Tab anklicken (erster sw-vframe: Beschreibung/Ausstattung/Lage)
         try:
             for t in page.query_selector_all(".v-tab"):
                 if "Beschreibung" in (t.inner_text() or ""):
@@ -167,27 +129,6 @@ def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
             )
         except Exception:
             time.sleep(0.8)
-
-        # Objektangaben-Tab anklicken (zweiter sw-vframe: Objektangaben/Energieausweis/Karte)
-        # → stellt sicher, dass Vuetify die expose-data <ul> in den DOM rendert.
-        try:
-            for t in page.query_selector_all(".v-tab"):
-                text = (t.inner_text() or "").strip()
-                if "Objektangaben" in text or "Angaben" in text:
-                    t.click()
-                    break
-        except Exception:
-            pass
-
-        # Auf expose-data warten, damit span.key / span.value im DOM sind
-        try:
-            page.wait_for_selector(
-                "ul.expose-data li span.key, ul.expose-data li span.value",
-                state="attached",
-                timeout=timeout_ms // 2
-            )
-        except Exception:
-            pass
 
         try:
             for fr in page.frames:
@@ -229,12 +170,12 @@ def soup_get(url: str) -> BeautifulSoup:
         FRAME_HTMLS[url] = frames or []
         if main_html:
             soup = BeautifulSoup(main_html, "lxml")
-            _log(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | frames={len(frames)}")
+            print(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | frames={len(frames)}")
             return soup
     except Exception as e:
-        _log(f"[RENDER] Fehler ({MSI_RENDER_ENGINE}): {e}")
+        print(f"[RENDER] Fehler ({MSI_RENDER_ENGINE}): {e}")
 
-    _log("[RENDER] Fallback: simple fetch (keine Frames)")
+    print("[RENDER] Fallback: simple fetch (keine Frames)")
     FRAME_HTMLS[url] = []
     return _simple_fetch(url)
 
@@ -259,13 +200,8 @@ def collect_detail_links(list_url: str):
 # UTILS
 # ===========================================================================
 def detect_category(page_text: str) -> str:
-    page_text_low = page_text.lower()
-    has_kaufpreis = bool(re.search(r"\b(kaufpreis|zum\s*kauf)\b", page_text_low))
-    has_miete = bool(RE_MIETE.search(page_text_low))
-    if has_kaufpreis:
-        return "Kaufen"
-    if has_miete:
-        return "Mieten"
+    if RE_MIETE.search(page_text): return "Mieten"
+    if RE_KAUF.search(page_text):  return "Kaufen"
     return "Kaufen"
 
 # ===========================================================================
@@ -343,112 +279,28 @@ def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
                         continue
     return ""
 
-def _price_from_scope(scope) -> str:
-    """Versucht, einen Preis aus einem BeautifulSoup-Scope zu extrahieren."""
-    PRICE_KEYS = ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")
-    # Einheitenpreise (je m², pro m², /m²) nicht als Gesamtpreis werten
-    PER_UNIT = (" je ", " pro ", "/m", " per ", " qm")
-    # 1) MSI-spezifisch: span.key + span.value innerhalb von <li>
-    for li in scope.select("li"):
-        key = li.select_one("span.key")
-        val = li.select_one("span.value")
-        if key and val:
-            label = key.get_text(" ", strip=True).rstrip(":").strip().lower()
-            if any(k in label for k in PRICE_KEYS):
-                if any(u in label for u in PER_UNIT):
-                    continue  # "Kaufpreis je m²" etc. überspringen
-                got = clean_price_string(val.get_text(" ", strip=True))
-                if got:
-                    v = parse_price_to_number(got)
-                    if v is not None and v < 100:
-                        continue  # implausibel kleiner Betrag – weitersuchen
-                    return got
-    # 2) dt/dd
-    for dt in scope.select("dt"):
+def extract_price_dom(soup: BeautifulSoup) -> str:
+    for dt in soup.select("dt"):
         label = (dt.get_text(" ", strip=True) or "").lower()
-        if any(k in label for k in PRICE_KEYS):
-            if any(u in label for u in PER_UNIT):
-                continue
+        if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
             dd = dt.find_next_sibling("dd")
             if dd:
                 got = clean_price_string(dd.get_text(" ", strip=True))
                 if got:
-                    v = parse_price_to_number(got)
-                    if v is not None and v < 100:
-                        continue
                     return got
-    # 3) Tabelle
-    for tr in scope.select("table tr"):
+    for tr in soup.select("table tr"):
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
         if len(cells) >= 2:
             label = cells[0].lower()
-            if any(k in label for k in PRICE_KEYS):
+            if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
                 got = clean_price_string(cells[1])
                 if got:
                     return got
-    # 4) <li>-Text mit RE_PRICE_LINE
-    for li in scope.select("li"):
+    for li in soup.select("li"):
         txt = li.get_text(" ", strip=True)
         m = RE_PRICE_LINE.search(txt)
         if m:
             return clean_price_string(m.group(2) + " €")
-    return ""
-
-def extract_price_dom(soup: BeautifulSoup) -> str:
-    # 0) Prominenter Preis-Span direkt im Static-HTML (außerhalb Vue/x-template),
-    #    z.B. <span class="text-large font-weight-semibold">219.000&nbsp;€</span>
-    #    Dieser ist immer im DOM, unabhängig von Vue-Rendering.
-    for span in soup.select("span.text-large, span.font-weight-semibold, .immo-listing__infotext span"):
-        txt = span.get_text(" ", strip=True)
-        if "€" in txt or "EUR" in txt:
-            p = clean_price_string(txt)
-            if p:
-                v = parse_price_to_number(p)
-                if v and v >= 1000:
-                    return p
-
-    # 1) Auf den Exposé-Bereich beschränken, damit Sidebar-Preise anderer Objekte
-    # nicht irrtümlich als Preis dieses Objekts erkannt werden.
-    scope = _find_expose_scope(soup)
-    p = _price_from_scope(scope)
-    if p:
-        return p
-    # 2) Vue-Templates (<script type="text/x-template">) direkt parsen,
-    # falls Vue beim Rendern noch nicht gemountet hat.
-    # Chrome serialisiert </ in Script-Content als <\/ — dies rückgängig machen.
-    for script in soup.find_all("script", attrs={"type": "text/x-template"}):
-        raw = script.string or ""
-        if not raw.strip():
-            continue
-        try:
-            raw = raw.replace("\\/", "/")  # Chrome HTML-Serializer escapet </ → <\/
-            tmpl = BeautifulSoup(raw, "lxml")
-            p = _price_from_scope(tmpl)
-            if p:
-                return p
-        except Exception:
-            continue
-    return ""
-
-def extract_price_from_text_labels(page_text: str) -> str:
-    """Suche nach gelabelten Preisen im Text (Miete zzgl. NK, Kaufpreis, etc.)
-    Erkennt auch MSI-Format: 'Miete zzgl. NK 630 €'"""
-    patterns = [
-        # Kaufpreis (höchste Priorität) – Doppelpunkt optional
-        re.compile(r"Kaufpreis\s*:?\s*([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
-        # Kaltmiete / Nettokaltmiete
-        re.compile(r"(?:Netto)?[Kk]altmiete\s*:?\s*([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
-        # Miete zzgl. NK (MSI-Format) – Doppelpunkt nach NK optional
-        re.compile(r"Miete\s+(?:zzgl\.?\s*NK\s*:?\s*)?([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
-        # Warmmiete
-        re.compile(r"Warmmiete\s*:?\s*([\d.\u00A0\u202F\u2009,]+)\s*€", re.I),
-    ]
-    for pat in patterns:
-        m = pat.search(page_text)
-        if m:
-            got = clean_price_string(m.group(1) + " €")
-            if got:
-                return got
     return ""
 
 def extract_price_strict_top(page_text: str) -> str:
@@ -471,37 +323,25 @@ def extract_price_strict_top(page_text: str) -> str:
 def extract_price(soup: BeautifulSoup, page_text: str) -> str:
     p = extract_price_from_jsonld(soup)
     if p:
-        _log(f"[DBG-PRICE] jsonld → {p}")
         return p
     p = extract_price_dom(soup)
     if p:
-        _log(f"[DBG-PRICE] dom → {p}")
-        return p
-    # NEU: Gelabelte Preise aus Fließtext (inkl. Mietpreise < 10.000 €)
-    p = extract_price_from_text_labels(page_text)
-    if p:
-        _log(f"[DBG-PRICE] text_labels → {p}")
         return p
     p = extract_price_strict_top(page_text)
     if p:
-        _log(f"[DBG-PRICE] strict_top → {p}")
         return p
-    # Fallback: ERSTEN Euro-Betrag nehmen (nicht max!) — erster ist meist der Objektpreis
     euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
     if euros:
-        for e in euros:
+        def to_float(e):
             mm = RE_EUR_NUMBER.search(e)
-            if mm:
-                try:
-                    val = float(_normalize_numstring(mm.group(0)))
-                    if val >= 50:  # Mindestens 50 €
-                        _log(f"[DBG-PRICE] fallback(>=50) → {clean_price_string(e)!r}  raw={e!r}")
-                        return clean_price_string(e)
-                except:
-                    continue
-    # Kein Preis gefunden — kurzen Textschnipsel für Diagnose ausgeben
-    snippet = page_text[:500].replace("\n", " ")
-    _log(f"[DBG-PRICE] KEIN PREIS  text_start={snippet!r}")
+            if not mm:
+                return 0.0
+            try:
+                return float(_normalize_numstring(mm.group(0)))
+            except:
+                return 0.0
+        best = max(euros, key=to_float)
+        return clean_price_string(best)
     return ""
 
 # ===========================================================================
@@ -801,10 +641,10 @@ def filter_valid_records(records: list) -> list:
             valid.append(record)
         else:
             invalid_count += 1
-            _log(f"[FILTER] Ungültiger Record: {record.get('Titel', 'KEIN TITEL')[:50]}")
+            print(f"[FILTER] Ungültiger Record: {record.get('Titel', 'KEIN TITEL')[:50]}")
     
     if invalid_count > 0:
-        _log(f"[FILTER] {invalid_count} ungültige Records herausgefiltert")
+        print(f"[FILTER] {invalid_count} ungültige Records herausgefiltert")
     
     return valid
 
@@ -812,7 +652,7 @@ def cleanup_empty_airtable_records(kategorie: str):
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
         return
     
-    _log(f"[CLEANUP] Prüfe Airtable auf leere Records ({kategorie})...")
+    print(f"[CLEANUP] Prüfe Airtable auf leere Records ({kategorie})...")
     
     try:
         all_ids, all_fields = airtable_list_all()
@@ -823,14 +663,14 @@ def cleanup_empty_airtable_records(kategorie: str):
                 to_delete.append(rec_id)
         
         if to_delete:
-            _log(f"[CLEANUP] Lösche {len(to_delete)} leere Records...")
+            print(f"[CLEANUP] Lösche {len(to_delete)} leere Records...")
             airtable_batch_delete(to_delete)
-            _log(f"[CLEANUP] ✅ {len(to_delete)} leere Records gelöscht")
+            print(f"[CLEANUP] ✅ {len(to_delete)} leere Records gelöscht")
         else:
-            _log("[CLEANUP] ✅ Keine leeren Records gefunden")
+            print("[CLEANUP] ✅ Keine leeren Records gefunden")
             
     except Exception as e:
-        _log(f"[CLEANUP] Fehler: {e}")
+        print(f"[CLEANUP] Fehler: {e}")
 
 # ===========================================================================
 # CACHES - Kurzbeschreibung UND Unterkategorie
@@ -842,7 +682,7 @@ def load_caches():
     global KURZBESCHREIBUNG_CACHE, UNTERKATEGORIE_CACHE
     
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
-        _log("[CACHE] Airtable nicht konfiguriert - Caches leer")
+        print("[CACHE] Airtable nicht konfiguriert - Caches leer")
         return
     
     try:
@@ -860,10 +700,10 @@ def load_caches():
             if unterkategorie:
                 UNTERKATEGORIE_CACHE[obj_nr] = unterkategorie
         
-        _log(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen geladen")
-        _log(f"[CACHE] {len(UNTERKATEGORIE_CACHE)} Unterkategorien geladen")
+        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen geladen")
+        print(f"[CACHE] {len(UNTERKATEGORIE_CACHE)} Unterkategorien geladen")
     except Exception as e:
-        _log(f"[CACHE] Fehler beim Laden: {e}")
+        print(f"[CACHE] Fehler beim Laden: {e}")
 
 def get_cached_kurzbeschreibung(objektnummer: str) -> str:
     return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
@@ -872,7 +712,7 @@ def get_cached_unterkategorie(objektnummer: str) -> str:
     return UNTERKATEGORIE_CACHE.get(objektnummer, "")
 
 # ===========================================================================
-# GPT KURZBESCHREIBUNG - PIPE-FORMAT
+# GPT KURZBESCHREIBUNG - NEUE VERSION
 # ===========================================================================
 KURZBESCHREIBUNG_FIELDS = [
     "Objekttyp",
@@ -886,65 +726,29 @@ KURZBESCHREIBUNG_FIELDS = [
     "Besonderheiten"
 ]
 
-# Reihenfolge für Pipe-Output
-KURZBESCHREIBUNG_ORDER = [
-    "Objekttyp",
-    "Baujahr",
-    "Wohnfläche",
-    "Grundstück",
-    "Zimmer",
-    "Preis",
-    "Standort",
-    "Energieeffizienz",
-    "Besonderheiten",
-]
-
-PLATZHALTER = {"-", "—", "k. A.", "unbekannt", "nicht angegeben", "N/A", "n/a", "keine", "–", ""}
-
 def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
-    """Normalisiert GPT-Ausgabe ins Pipe-Format mit Labels. Ergänzt fehlende Werte aus Scrape-Daten."""
+    """Normalisiert GPT-Ausgabe. KEINE Platzhalter, nur vorhandene Felder."""
     parsed = {}
-
-    # Versuche zuerst Pipe-Format zu parsen (GPT hat direkt eine Zeile geliefert)
-    for line in gpt_output.strip().splitlines():
+    for line in gpt_output.strip().split("\n"):
         line = line.strip()
-        if "|" in line:
-            # Pipe-Zeile → Segmente parsen, Labels extrahieren
-            parts = [p.strip() for p in line.split("|")]
-            for part in parts:
-                if not part or part in PLATZHALTER:
-                    continue
-                if ":" in part:
-                    key, _, value = part.partition(":")
-                    key = key.strip()
-                    value = value.strip()
-                    if key in KURZBESCHREIBUNG_FIELDS and value and value not in PLATZHALTER:
-                        parsed[key] = value
-            if parsed:
-                break
-
-    # Falls kein Pipe-Format: altes Zeilenformat parsen
-    if not parsed:
-        for line in gpt_output.strip().split("\n"):
-            line = line.strip()
-            if not line or ":" not in line:
-                continue
-            key, _, value = line.partition(":")
+        if not line:
+            continue
+        if ":" in line:
+            key, value = line.split(":", 1)
             key = key.strip()
             value = value.strip()
-            if value and value not in PLATZHALTER:
+            if value and value not in ["-", "—", "k. A.", "unbekannt", "nicht angegeben", ""]:
                 parsed[key] = value
-
-    # Scrape-Daten ergänzen wo GPT nichts geliefert hat
+    
     scrape_mapping = {
         "Zimmer": "zimmer",
-        "Wohnfläche": "wohnflaeche",
+        "Wohnfläche": "wohnflaeche", 
         "Grundstück": "grundstueck",
         "Baujahr": "baujahr",
         "Preis": "preis",
         "Standort": "standort",
     }
-
+    
     for field, scrape_key in scrape_mapping.items():
         if field not in parsed or not parsed[field]:
             scrape_value = scraped_data.get(scrape_key, "")
@@ -952,7 +756,7 @@ def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
                 if field == "Preis":
                     try:
                         preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
-                        parsed[field] = f"{int(preis_num):,} €".replace(",", ".")
+                        parsed[field] = f"{int(preis_num)} €"
                     except:
                         pass
                 elif field == "Wohnfläche":
@@ -963,29 +767,26 @@ def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
                     val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
                     if val:
                         parsed[field] = f"{val} m²"
-                elif field == "Zimmer":
-                    parsed[field] = str(scrape_value)
                 else:
                     parsed[field] = str(scrape_value)
-
-    # Pipe-Output bauen: Label: Wert, in fester Reihenfolge
-    parts = []
-    for field in KURZBESCHREIBUNG_ORDER:
+    
+    output_lines = []
+    for field in KURZBESCHREIBUNG_FIELDS:
         value = parsed.get(field, "")
-        if value and value.strip() and value.strip() not in PLATZHALTER:
-            parts.append(f"{field}: {value.strip()}")
-
-    return " | ".join(parts)
+        if value and value.strip():
+            output_lines.append(f"{field}: {value}")
+    
+    return "\n".join(output_lines)
 
 def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
                                zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
                                objektnummer: str = "") -> str:
-    """Generiert strukturierte Kurzbeschreibung mit GPT im Pipe-Format."""
+    """Generiert strukturierte Kurzbeschreibung mit GPT. NEUE VERSION mit strengem Prompt."""
     
     if objektnummer:
         cached = get_cached_kurzbeschreibung(objektnummer)
         if cached:
-            _log(f"[CACHE] Kurzbeschreibung aus Cache für {objektnummer[:20]}...")
+            print(f"[CACHE] Kurzbeschreibung aus Cache für {objektnummer[:20]}...")
             return cached
     
     scraped_data = {
@@ -1001,13 +802,14 @@ def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, pre
     if not OPENAI_API_KEY:
         return normalize_kurzbeschreibung("", scraped_data)
     
+    # NEUER STRENGER PROMPT
     prompt = f"""# Rolle
 Du bist ein präziser Immobilien-Datenanalyst und Parser. Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich objektive, explizit genannte Fakten zu extrahieren und streng strukturiert auszugeben. Du arbeitest regelbasiert, deterministisch und formatgenau. Kreative Ergänzungen sind untersagt.
 
 # Aufgabe
 1. Analysiere die bereitgestellte Immobilienanzeige vollständig.
 2. Extrahiere nur eindeutig genannte, objektive Fakten.
-3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Format aus.
+3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
 4. Lasse jedes Feld vollständig weg, zu dem keine eindeutige Angabe vorliegt.
 
 # Eingabedaten
@@ -1018,21 +820,48 @@ STANDORT: {ort if ort else 'nicht angegeben'}
 BESCHREIBUNG: {beschreibung[:3000]}
 
 # Erlaubte Felder (Whitelist – verbindlich)
-Objekttyp, Baujahr, Wohnfläche, Grundstück, Zimmer, Preis, Standort, Energieeffizienz, Besonderheiten
+Es dürfen ausschließlich die folgenden Felder verwendet werden. Jedes andere Feld ist strikt verboten.
+
+Objekttyp
+Baujahr
+Wohnfläche
+Grundstück
+Zimmer
+Preis
+Standort
+Energieeffizienz
+Besonderheiten
 
 # Ausgabeformat (verbindlich)
-Gib EINE EINZIGE Zeile aus. Jedes Feld wird mit Label ausgegeben und mit " | " (Pipe mit Leerzeichen) getrennt.
+Die Ausgabe muss exakt diesem Muster folgen. Jede Eigenschaft steht in einer eigenen Zeile. Keine Leerzeilen, keine zusätzlichen Texte, keine Markdown-Formatierung.
 
-Beispiel: Objekttyp: Eigentumswohnung | Baujahr: 2015 | Wohnfläche: 85 m² | Grundstück: 350 m² | Zimmer: 3 | Preis: 515.000 € | Standort: 10115 Berlin | Energieeffizienz: B | Besonderheiten: Balkon, Aufzug, Tiefgarage
+Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
+Baujahr: [Jahr]
+Wohnfläche: [Zahl in m²]
+Grundstück: [Zahl in m²]
+Zimmer: [Anzahl]
+Preis: [Zahl in €]
+Standort: [Ort oder PLZ Ort]
+Energieeffizienz: [Klasse]
+Besonderheiten: [kommaseparierte Liste]
 
 # Strikte Regeln (bindend)
 • Es ist strengstens untersagt, eigene Felder zu erfinden.
-• Keine Platzhalter (z.B. "-", "—", "k. A.", "unbekannt").
-• Felder ohne eindeutige Angabe komplett weglassen – kein leeres Feld, kein doppelter Trennstrich.
-• Preise im deutschen Format mit Punkt als Tausender-Trennzeichen (z.B. 515.000 €).
+• Felder wie „Schlafzimmer", „Kategorie", „Etage", „Ausstattung", „Kauf/Miete" oder ähnliche sind ausnahmslos verboten.
+• Es dürfen keine Platzhalter verwendet werden (z. B. „-", „—", „k. A.", „unbekannt").
+• Wenn ein Feld nicht eindeutig ermittelbar ist, darf die gesamte Zeile nicht ausgegeben werden.
+• Die Reihenfolge der Zeilen muss exakt der Vorgabe entsprechen.
+• Es darf niemals mehr als ein Feld pro Zeile stehen.
 • Verwende ausschließlich arabische Ziffern.
-• Einheiten: Wohnfläche und Grundstück in m², Preis in €.
-• Alles in EINER Zeile."""
+• Einheiten exakt wie folgt anhängen:
+  – Wohnfläche und Grundstück: m²
+  – Preis: €
+• Keine Interpretationen, keine Schätzungen, keine Ableitungen.
+• Im Zweifel gilt: lieber weniger Felder ausgeben, niemals mehr.
+• KEINE LEERZEILEN in der Ausgabe!
+
+# Ziel
+Die Ausgabe wird automatisiert weiterverarbeitet (z. B. Airtable, Voiceflow, Such- und Filterlogiken). Jede Abweichung vom Format gilt als Fehler."""
 
     try:
         headers = {
@@ -1043,7 +872,7 @@ Beispiel: Objekttyp: Eigentumswohnung | Baujahr: 2015 | Wohnfläche: 85 m² | Gr
         payload = {
             "model": "gpt-4o-mini",
             "messages": [
-                {"role": "system", "content": "Du bist ein regelbasierter Datenparser. Halte dich strikt an die Vorgaben. Keine Kreativität, keine Ergänzungen. Ausgabe: EINE Zeile mit Label: Wert | Label: Wert Format."},
+                {"role": "system", "content": "Du bist ein regelbasierter Datenparser. Halte dich strikt an die Vorgaben. Keine Kreativität, keine Ergänzungen. Keine Leerzeilen."},
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": 400,
@@ -1063,11 +892,11 @@ Beispiel: Objekttyp: Eigentumswohnung | Baujahr: 2015 | Wohnfläche: 85 m² | Gr
         
         kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
         
-        _log(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
+        print(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
         return kurzbeschreibung
         
     except Exception as e:
-        _log(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
+        print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
         return normalize_kurzbeschreibung("", scraped_data)
 
 # ===========================================================================
@@ -1105,7 +934,7 @@ def gpt_classify_unterkategorie(titel: str, beschreibung: str, objektnummer: str
     if objektnummer:
         cached = get_cached_unterkategorie(objektnummer)
         if cached:
-            _log(f"[CACHE] Unterkategorie aus Cache: {cached}")
+            print(f"[CACHE] Unterkategorie aus Cache: {cached}")
             return cached
     
     if not OPENAI_API_KEY:
@@ -1157,14 +986,14 @@ Beschreibung: {beschreibung[:1500]}"""
         valid = {"Wohnung", "Haus", "Gewerbe", "Grundstück"}
         
         if output in valid:
-            _log(f"[GPT] Unterkategorie: {output}")
+            print(f"[GPT] Unterkategorie: {output}")
             return output
         else:
-            _log(f"[GPT] Ungültige Kategorie '{output}', verwende Heuristik")
+            print(f"[GPT] Ungültige Kategorie '{output}', verwende Heuristik")
             return heuristic_subcategory(titel, beschreibung)
         
     except Exception as e:
-        _log(f"[ERROR] GPT Klassifikation fehlgeschlagen: {e}")
+        print(f"[ERROR] GPT Klassifikation fehlgeschlagen: {e}")
         return heuristic_subcategory(titel, beschreibung)
 
 # ===========================================================================
@@ -1173,40 +1002,18 @@ Beschreibung: {beschreibung[:1500]}"""
 def parse_detail(detail_url: str, mode: str):
     soup = soup_get(detail_url)
     page_text = soup.get_text("\n", strip=True)
-    # Sidebar ("Neueste Immobilien" u.ä.) abschneiden, damit Preise anderer
-    # Objekte nicht in Preis-Extraktion oder Kategorie-Erkennung einfließen.
-    page_text_clean = truncate_at_sidebar(page_text)
-
-    # Inhalte aus iFrames (Playwright-Rendering) ebenfalls einbeziehen.
-    # Die Exposé-Daten (Preis, Wohnfläche, …) stecken oft im Frame-HTML.
-    frame_soups: list[BeautifulSoup] = []
-    for frame_html in FRAME_HTMLS.get(detail_url, []):
-        try:
-            fs = BeautifulSoup(frame_html, "lxml")
-            ft = truncate_at_sidebar(fs.get_text("\n", strip=True))
-            if ft.strip():
-                page_text_clean += "\n" + ft
-                frame_soups.append(fs)
-        except Exception:
-            pass
 
     h1 = soup.select_one("h1")
     title = h1.get_text(strip=True) if h1 else ""
 
     description = get_description(detail_url, soup)
 
-    m_obj = RE_OBJEKTNR.search(page_text_clean)
+    m_obj = RE_OBJEKTNR.search(page_text)
     objektnummer = m_obj.group(1).strip() if m_obj else ""
 
-    # Preis: erst Hauptseite, dann Frame-Soups als Fallback
-    preis_value = extract_price(soup, page_text_clean)
-    if not preis_value:
-        for fs in frame_soups:
-            preis_value = extract_price(fs, "")  # page_text already merged above
-            if preis_value:
-                break
+    preis_value = extract_price(soup, page_text)
 
-    m_plz = RE_PLZ_ORT_STRICT.search(page_text_clean)
+    m_plz = RE_PLZ_ORT_STRICT.search(page_text)
     ort = ""
     if m_plz:
         plz, name = m_plz.group(1), m_plz.group(2)
@@ -1223,21 +1030,10 @@ def parse_detail(detail_url: str, mode: str):
         if img and img.has_attr("src"):
             image_url = urljoin(BASE, img["src"])
 
-    page_text_low = page_text_clean.lower()
-
-    # Kategorie-Erkennung: Kaufpreis hat Vorrang vor Miet-Keywords
-    # Bei Kapitalanlagen steht oft "Kaltmiete" als Mieteinnahme auf der Seite
-    has_kaufpreis = bool(re.search(r"\b(kaufpreis|zum\s*kauf)\b", page_text_low))
-    has_miete = bool(RE_MIETE.search(page_text_low))
-
-    if has_kaufpreis:
-        kategorie_detected = "Kaufen"
-    elif has_miete and not has_kaufpreis:
-        kategorie_detected = "Mieten"
-    else:
-        kategorie_detected = "Kaufen"
-
-    additional_data = extract_additional_data(page_text_clean)
+    page_text_low = page_text.lower()
+    kategorie_detected = "Mieten" if RE_MIETE.search(page_text_low) else "Kaufen"
+    
+    additional_data = extract_additional_data(page_text)
 
     return {
         "Titel":        title,
@@ -1298,7 +1094,7 @@ def make_record(row):
 # ===========================================================================
 def sync_category(scraped_rows, category_label: str):
     allowed = airtable_existing_fields()
-    _log(f"[Airtable] Erkannte Felder: {sorted(list(allowed)) or '(keine)'}")
+    print(f"[Airtable] Erkannte Felder: {sorted(list(allowed)) or '(keine)'}")
 
     all_ids, all_fields = airtable_list_all()
     existing = {}
@@ -1325,7 +1121,7 @@ def sync_category(scraped_rows, category_label: str):
 
     to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
 
-    _log(f"[SYNC] {category_label} → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
+    print(f"\n[SYNC] {category_label} → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
     
     if to_create:
         airtable_batch_create(to_create)
@@ -1342,104 +1138,57 @@ def run(mode="auto"):
     csv_kauf  = "msi_kauf.csv"
     csv_miete = "msi_miete.csv"
 
-    run_t0 = time.monotonic()
-    _log(f"{'='*70}")
-    _log(f"  MSI Scraper gestartet  |  mode={mode}")
-    _log(f"{'='*70}")
-
     # Lade Caches
-    _log("[INIT] Lade Caches aus Airtable...")
+    print("[INIT] Lade Caches aus Airtable...")
     load_caches()
 
     all_rows, seen = [], set()
-    stats = {"kauf": 0, "miete": 0, "skip": 0, "fehler": 0}
-    total_n = 0  # laufende Gesamtzahl verarbeiteter Objekte
-
     for idx, list_url in enumerate(get_list_page_urls("kauf"), 1):
         try:
             detail_links = collect_detail_links(list_url)
         except Exception as e:
-            _log(f"[WARN] Abbruch beim Lesen der Liste: {list_url} -> {e}")
+            print(f"[WARN] Abbruch beim Lesen der Liste: {list_url} -> {e}")
             break
 
         if not detail_links:
-            _log(f"[INFO] Seite {idx}: keine Einträge – Ende der Paginierung.")
+            print(f"[INFO] Keine Einträge auf Seite {idx} – Stop.")
             break
 
         new_links = [u for u in detail_links if u not in seen]
         seen.update(new_links)
         if not new_links:
-            _log(f"[INFO] Seite {idx}: alle Links bereits gesehen – weiter.")
+            print(f"[INFO] Seite {idx}: keine neuen Links – weiter.")
             continue
 
-        page_t0 = time.monotonic()
-        _log(f"")
-        _log(f"{'─'*70}")
-        _log(f"  Seite {idx}  |  {len(new_links)} neue Exposés  |  Gesamt bisher: {total_n}")
-        _log(f"{'─'*70}")
+        print(f"[{mode.upper()}] Seite {idx}: {len(new_links)} Exposés")
 
         for j, url in enumerate(new_links, 1):
-            obj_t0 = time.monotonic()
             try:
                 row = parse_detail(url, mode)
 
                 if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
-                    stats["skip"] += 1
-                    _log(f"  [{j:2d}/{len(new_links)}] SKIP  verkauft  {row.get('Titel','')[:55]}")
+                    print(f"  - {j}/{len(new_links)} SKIPPED (verkauft)")
                     continue
 
                 record = make_record(row)
                 all_rows.append(record)
-                total_n += 1
-                kat = record.get("Kategorie", "?")
-                if kat == "Kaufen":
-                    stats["kauf"] += 1
-                else:
-                    stats["miete"] += 1
-
-                obj_s = f"{time.monotonic()-obj_t0:.1f}s"
-                preis = _fmt_preis(record)
-                ukat  = record.get("Unterkategorie") or "–"
-                titel = record["Titel"][:48]
-                _log(
-                    f"  [{j:2d}/{len(new_links)}] ✓  #{total_n:3d}"
-                    f"  {kat:6}  {ukat:15}  {preis}  {titel}"
-                    f"  ({obj_s})"
-                )
+                print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record.get('Unterkategorie', 'N/A'):12} | {record['Titel'][:50]}")
                 time.sleep(0.1)
             except Exception as e:
-                stats["fehler"] += 1
-                slug = url.replace("https://www.msi-hessen.de", "")
-                _log(f"  [{j:2d}/{len(new_links)}] ✗  FEHLER  {slug}  →  {e}")
+                print(f"    [FEHLER] {url} -> {e}")
                 continue
-
-        page_s = _elapsed(page_t0)
-        _log(
-            f"  Seite {idx} fertig in {page_s}"
-            f"  |  Gesamt {total_n}"
-            f"  (Kauf: {stats['kauf']}, Miete: {stats['miete']},"
-            f" Skip: {stats['skip']}, Fehler: {stats['fehler']})"
-        )
         time.sleep(0.2)
 
-    _log(f"")
-    _log(f"{'='*70}")
-    _log(f"  Scraping abgeschlossen  |  Laufzeit: {_elapsed(run_t0)}")
-    _log(f"  Gesamt: {total_n} Objekte  "
-         f"(Kauf: {stats['kauf']}, Miete: {stats['miete']},"
-         f" Skip: {stats['skip']}, Fehler: {stats['fehler']})")
-    _log(f"{'='*70}")
-
     if not all_rows:
-        _log("[WARN] Keine Datensätze gefunden.")
+        print("[WARN] Keine Datensätze gefunden.")
         return
 
     # VALIDIERUNG
-    _log(f"[VALIDATE] Prüfe {len(all_rows)} Records...")
+    print(f"\n[VALIDATE] Prüfe {len(all_rows)} Records...")
     all_rows = filter_valid_records(all_rows)
 
     if not all_rows:
-        _log("[WARN] Keine gültigen Datensätze nach Filterung.")
+        print("[WARN] Keine gültigen Datensätze nach Filterung.")
         return
 
     rows_kauf  = [r for r in all_rows if r["Kategorie"] == "Kaufen"]
@@ -1451,20 +1200,20 @@ def run(mode="auto"):
         rows_kauf = []
 
     cols = ["Titel","Kategorie","Unterkategorie","Webseite","Objektnummer","Beschreibung","Kurzbeschreibung","Bild","Preis","Standort"]
-
+    
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
             w.writeheader()
             w.writerows(rows_kauf)
-        _log(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
-
+        print(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
+    
     if rows_miete:
         with open(csv_miete, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
             w.writeheader()
             w.writerows(rows_miete)
-        _log(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
+        print(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
 
     if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
         if rows_kauf:
@@ -1473,9 +1222,9 @@ def run(mode="auto"):
         if rows_miete:
             sync_category(rows_miete, "Mieten")
             cleanup_empty_airtable_records("Mieten")
-        _log(f"[Airtable] Synchronisation abgeschlossen  |  Gesamtlaufzeit: {_elapsed(run_t0)}")
+        print("[Airtable] Synchronisation abgeschlossen.\n")
     else:
-        _log("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
+        print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
 
 # ===========================================================================
 if __name__ == "__main__":
