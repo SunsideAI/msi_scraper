@@ -1,10 +1,24 @@
 # msi_v2_airtable_replace.py
 # -*- coding: utf-8 -*-
 """
-Scraper für https://www.msi-hessen.de/
-v2.0 - Mit verbesserter GPT-Kurzbeschreibung, Unterkategorie-Caching und Validierung
-"""
+MSI Hessen Scraper v3
+=====================
+Scrapt Kauf- und Mietimmobilien von msi-hessen.de und synchronisiert
+sie mit einer Airtable-Datenbank.
 
+Seitenstruktur (Stand März 2026):
+  - Kategorie + Standort: <p class="h5"><span class="badge">Wohnung zur Miete</span> 36304 Alsfeld</p>
+  - Preis + ObjektNr:     .immo-listing__infotext span.text-large / span.lh-large
+  - Zimmer/Schlaf/Bad:     .immo-listing__infotext ul.list-bordered li[title]
+  - Beschreibung:          JSON-LD "description" (Vue-Tabs nur mit JS-Rendering)
+  - Bild:                  .immo-expose__head--image background-image
+  - Sidebar-Listings:      .immo-listing__wrapper → AUSSCHLIESSEN bei Extraktion
+
+Nutzung:
+  python msi_v2_airtable_replace.py           # auto (Kauf + Miete)
+  python msi_v2_airtable_replace.py kauf      # nur Kaufen
+  python msi_v2_airtable_replace.py miete     # nur Mieten
+"""
 import sys
 import time
 import csv
@@ -13,14 +27,15 @@ import json
 import requests
 import re
 from urllib.parse import quote, urljoin
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 # ===========================================================================
 # KONFIGURATION / ENV
 # ===========================================================================
 BASE = "https://www.msi-hessen.de"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
 }
 
@@ -31,493 +46,293 @@ AIRTABLE_TABLE    = os.getenv("AIRTABLE_TABLE", "").strip()
 AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "").strip()
 AIRTABLE_VIEW     = os.getenv("AIRTABLE_VIEW", "").strip()
 
-# OpenAI für Kurzbeschreibung
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-# Rendering ENV (optional)
-MSI_RENDER         = os.getenv("MSI_RENDER", "0").strip() == "1"
-MSI_RENDER_ENGINE  = os.getenv("MSI_RENDER_ENGINE", "playwright").strip().lower()
-MSI_RENDER_TIMEOUT = int(os.getenv("MSI_RENDER_TIMEOUT", "20000"))
-
-print(f"[CFG] MSI_RENDER={MSI_RENDER} | ENGINE={MSI_RENDER_ENGINE} | TIMEOUT={MSI_RENDER_TIMEOUT}")
-
-# iFrame-DOMs zwischenspeichern
-FRAME_HTMLS: dict[str, list[str]] = {}
-
 # ===========================================================================
-# REGEX & KONSTANTEN
+# HTTP
 # ===========================================================================
-THIN_SPACES = "\u00A0\u202F\u2009"
-RE_EUR_NUMBER = re.compile(r"\b\d{1,3}(?:[.\u00A0\u202F\u2009]\d{3})*(?:,\d{2})?\b")
-RE_EUR_ANY    = re.compile(r"\b\d{1,3}(?:[.\u00A0\u202F\u2009]\d{3})*(?:,\d{2})?\s*[€EUR]?")
-RE_PRICE_LINE = re.compile(
-    r"(kaufpreis|preis|kaltmiete|warmmiete|nettokaltmiete|miete)\s*:?\s*([0-9.\u00A0\u202F\u2009,]+)\s*[€]?",
-    re.I
-)
-RE_OBJEKTNR       = re.compile(r"Objekt[-\s]?Nr\.?:\s*([A-Za-z0-9\-_/]+)")
-RE_PLZ_ORT_STRICT = re.compile(r"\b(?!0{5})(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß\-\s]+?)\b(?![A-Za-zÄÖÜäöüß])")
-
-RE_KAUF  = re.compile(r"\bzum\s*kauf\b", re.IGNORECASE)
-RE_MIETE = re.compile(r"\bzur\s*miete\b|\b(kaltmiete|warmmiete|nettokaltmiete)\b", re.IGNORECASE)
-
-STOP_STRINGS = (
-    "Ihre Anfrage", "Exposé anfordern", "Neueste Immobilien", "Teilen auf",
-    "Datenschutz", "Impressum", "designed by wavepoint",
-    "Ansprechpartner", "Kontaktieren Sie uns", "Zur Objektanfrage",
-    "msi-hessen.de"
-)
-
-RE_PHONE = re.compile(r"\b(?:\+?\d{1,3}[\s/.-]?)?(?:0\d|\d{2,3})[\d\s/.-]{6,}\b")
-RE_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-# ===========================================================================
-# TEXT-BEREINIGUNG
-# ===========================================================================
-def clean_text(text: str) -> str:
-    """Bereinigt Text: Entfernt mehrfache Leerzeilen und unnötige Whitespaces."""
-    if not text:
-        return ""
-    text = re.sub(r'\n\s*\n+', '\n', text)
-    lines = [line.strip() for line in text.split('\n')]
-    lines = [line for line in lines if line]
-    return '\n'.join(lines)
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s{2,}", " ", (s or "").strip())
-
-# ===========================================================================
-# HTTP / HTML – immer rendern, wenn MSI_RENDER=1
-# ===========================================================================
-def _simple_fetch(url: str) -> BeautifulSoup:
+def fetch(url: str) -> BeautifulSoup:
+    """Einfacher HTTP-Fetch. Kein JS-Rendering nötig."""
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
 
-def _render_with_playwright(url: str, timeout_ms: int) -> tuple[str, list[str]]:
-    from playwright.sync_api import sync_playwright
-    frame_htmls = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="de-DE", user_agent=HEADERS["User-Agent"])
-        page = context.new_page()
-        page.set_default_timeout(timeout_ms)
-        page.goto(url, wait_until="domcontentloaded")
-
-        for sel in [".sw-yframe .sw-vframe .v-expose .v-tabs-items",
-                    ".v-expose .v-tabs-items",
-                    ".v-expose"]:
-            try:
-                page.wait_for_selector(sel, state="attached", timeout=timeout_ms//2)
-                break
-            except Exception:
-                continue
-
-        try:
-            for t in page.query_selector_all(".v-tab"):
-                if "Beschreibung" in (t.inner_text() or ""):
-                    t.click()
-                    break
-        except Exception:
-            pass
-
-        try:
-            page.wait_for_selector(
-                ".v-expose .v-tabs-items .v-window__container #tab-0 .v-card__text p:not(.h4), "
-                ".v-expose .v-tabs-items .v-window__container .v-window-item.v-window-item--active .v-card__text p:not(.h4)",
-                state="visible",
-                timeout=timeout_ms//2
-            )
-        except Exception:
-            time.sleep(0.8)
-
-        try:
-            for fr in page.frames:
-                fr_url = (fr.url or "").lower()
-                if any(k in fr_url for k in ("screenwork", "immo", "expose", "angebote")):
-                    try:
-                        frame_htmls.append(fr.content())
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=timeout_ms//2)
-        except Exception:
-            pass
-
-        main_html = page.content()
-        context.close()
-        browser.close()
-        return main_html, frame_htmls
-
-def _render_with_requests_html(url: str, timeout_ms: int) -> tuple[str, list[str]]:
-    from requests_html import HTMLSession
-    s = HTMLSession()
-    r = s.get(url, headers=HEADERS, timeout=30)
-    r.html.render(timeout=timeout_ms/1000.0, reload=False, scrolldown=0)
-    return r.html.html, []
-
-def soup_get(url: str) -> BeautifulSoup:
-    if not MSI_RENDER:
-        return _simple_fetch(url)
-
-    try:
-        if MSI_RENDER_ENGINE == "requests_html":
-            main_html, frames = _render_with_requests_html(url, MSI_RENDER_TIMEOUT)
-        else:
-            main_html, frames = _render_with_playwright(url, MSI_RENDER_TIMEOUT)
-        FRAME_HTMLS[url] = frames or []
-        if main_html:
-            soup = BeautifulSoup(main_html, "lxml")
-            print(f"[RENDER] ok ({MSI_RENDER_ENGINE}) | frames={len(frames)}")
-            return soup
-    except Exception as e:
-        print(f"[RENDER] Fehler ({MSI_RENDER_ENGINE}): {e}")
-
-    print("[RENDER] Fallback: simple fetch (keine Frames)")
-    FRAME_HTMLS[url] = []
-    return _simple_fetch(url)
-
 # ===========================================================================
-# LISTEN / LINKS
+# LISTING-SEITEN: Detail-Links sammeln
 # ===========================================================================
-def get_list_page_urls(mode: str, max_pages: int = 50):
-    first = f"{BASE}/kaufen/immobilienangebote/"
-    pattern = f"{BASE}/kaufen/immobilienangebote/page/{{n}}/"
-    return [first] + [pattern.format(n=i) for i in range(2, max_pages + 1)]
+def get_listing_urls(mode: str, max_pages: int = 50) -> list[str]:
+    """
+    Generiert Listing-URLs für Kauf und/oder Miete.
+    Gibt Liste von (url, listing_mode) Tupeln zurück.
+    """
+    pages = []
+    modes = []
+    if mode in ("kauf", "auto"):
+        modes.append("buy")
+    if mode in ("miete", "auto"):
+        modes.append("rent")
 
-def collect_detail_links(list_url: str):
-    soup = soup_get(list_url)
+    for mt in modes:
+        base = f"{BASE}/kaufen/immobilienangebote/?mt={mt}&sort=sort%7Cdesc"
+        pages.append(base)
+        for i in range(2, max_pages + 1):
+            pages.append(f"{BASE}/kaufen/immobilienangebote/page/{i}/?mt={mt}&sort=sort%7Cdesc")
+    return pages
+
+
+def collect_detail_links(list_url: str) -> list[str]:
+    """Sammelt alle Detail-Links von einer Listing-Seite."""
+    soup = fetch(list_url)
     links = set()
     for a in soup.select('a[href*="/angebote/"]'):
-        href = a.get("href")
-        if href:
-            links.add(href if href.startswith("http") else urljoin(BASE, href))
-    return list(links)
+        href = a.get("href", "")
+        if not href or href.endswith("/angebote/") or "?" in href:
+            continue
+        full_url = href if href.startswith("http") else urljoin(BASE, href)
+        if "/angebote/" in full_url and full_url.count("/") >= 5:
+            links.add(full_url)
+    return sorted(links)
 
 # ===========================================================================
-# UTILS
+# DETAIL-PARSING: Zuverlässige Extraktion aus dem Server-HTML
 # ===========================================================================
-def detect_category(page_text: str) -> str:
-    if RE_MIETE.search(page_text): return "Mieten"
-    if RE_KAUF.search(page_text):  return "Kaufen"
+def _in_sidebar(tag, sidebar_ids: set) -> bool:
+    """Prüft ob ein Tag innerhalb eines Sidebar-Wrappers liegt."""
+    for parent in tag.parents:
+        if id(parent) in sidebar_ids:
+            return True
+    return False
+
+
+def _detect_kategorie(text: str) -> str:
+    """Erkennt Kauf/Miete aus dem Badge-Text."""
+    text_lower = text.lower()
+    if "miete" in text_lower or "mieten" in text_lower:
+        return "Mieten"
+    if "kauf" in text_lower or "kaufen" in text_lower:
+        return "Kaufen"
     return "Kaufen"
 
-# ===========================================================================
-# PREIS
-# ===========================================================================
-def _normalize_numstring(s: str) -> str:
-    if not s: return ""
-    s = s.strip()
-    for ch in THIN_SPACES:
-        s = s.replace(ch, "")
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
+
+def _parse_price_to_number(price_str: str):
+    """Konvertiert '159.900 €' -> 159900.0 oder None."""
+    if not price_str:
+        return None
+    cleaned = price_str.replace("€", "").replace("\xa0", "").strip()
+    # "159.900" -> 159900
+    cleaned = re.sub(r"[^\d,.]", "", cleaned)
+    if not cleaned:
+        return None
+    # Deutsche Notation: Punkt als Tausender, Komma als Dezimal
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(",", ".")
     else:
-        if "." in s:
-            last = s.rsplit(".", 1)[-1]
-            if last.isdigit() and len(last) in (3, 6):
-                s = s.replace(".", "")
-    return s
-
-def clean_price_string(raw: str) -> str:
-    if not raw: return ""
-    m = RE_EUR_NUMBER.search(raw)
-    if not m: return ""
-    num = _normalize_numstring(m.group(0))
+        # Nur Punkte: prüfe ob Tausender-Separator
+        parts = cleaned.split(".")
+        if len(parts) > 1 and len(parts[-1]) == 3:
+            cleaned = cleaned.replace(".", "")
     try:
-        val = float(num)
-    except Exception:
-        return ""
-    return f"{val:,.0f} €".replace(",", ".")
-
-def parse_price_to_number(label: str):
-    if not label: return None
-    m = RE_EUR_NUMBER.search(label)
-    if not m: return None
-    num = _normalize_numstring(m.group(0))
-    try:
-        return float(num)
-    except Exception:
+        return float(cleaned)
+    except ValueError:
         return None
 
-# ===========================================================================
-# PREIS-EXTRAKTION
-# ===========================================================================
-def extract_price_from_jsonld(soup: BeautifulSoup) -> str:
+
+def parse_detail(url: str) -> dict:
+    """
+    Parst eine MSI-Detailseite und gibt strukturierte Daten zurück.
+    Funktioniert ohne JS-Rendering.
+
+    WICHTIG: Sidebar-Listings (.immo-listing__wrapper) werden bei der
+    Extraktion ausgeschlossen, da sie eigene Zimmer/Preis-Daten haben.
+    """
+    soup = fetch(url)
+
+    result = {
+        "Titel": "",
+        "Typ": "",
+        "Kategorie": "",
+        "Standort": "",
+        "Preis": "",
+        "Objektnummer": "",
+        "Beschreibung": "",
+        "Zimmer": "",
+        "Schlafzimmer": "",
+        "Badezimmer": "",
+        "Wohnflaeche": "",
+        "Bild_URL": "",
+        "URL": url,
+        "Ansprechpartner": "",
+    }
+
+    detail_page = soup.select_one(".immobiliendetailseite") or soup
+
+    # Sidebar-Elemente markieren (IDs merken)
+    sidebar_ids = set()
+    for sw in detail_page.select(".immo-listing__wrapper"):
+        sidebar_ids.add(id(sw))
+
+    # --- Titel (h1) ---
+    h1 = detail_page.select_one("h1")
+    if h1 and not _in_sidebar(h1, sidebar_ids):
+        result["Titel"] = " ".join(h1.get_text(" ", strip=True).split())
+
+    # --- Kategorie + Standort ---
+    # <p class="h5"><span class="badge badge-secondary">Wohnung zur Miete</span> 36304 Alsfeld</p>
+    top_p = detail_page.select_one("p.h5")
+    if top_p and not _in_sidebar(top_p, sidebar_ids):
+        badge = top_p.select_one("span.badge")
+        if badge:
+            badge_text = badge.get_text(strip=True)
+            result["Kategorie"] = _detect_kategorie(badge_text)
+            result["Typ"] = badge_text
+            full_text = top_p.get_text(" ", strip=True)
+            result["Standort"] = full_text.replace(badge_text, "").strip()
+        else:
+            full_text = top_p.get_text(" ", strip=True)
+            result["Kategorie"] = _detect_kategorie(full_text)
+            m = re.search(r"(\d{5})\s+(.+)", full_text)
+            result["Standort"] = f"{m.group(1)} {m.group(2).strip()}" if m else full_text.strip()
+
+    # --- Preis + Objektnummer ---
+    # Im ERSTEN .immo-listing__infotext (Hauptbereich, nicht Sidebar)
+    infotext = None
+    for it in detail_page.select(".immo-listing__infotext"):
+        if not _in_sidebar(it, sidebar_ids):
+            infotext = it
+            break
+
+    if infotext:
+        # Preis: <span class="text-large font-weight-semibold">159.900 €</span>
+        price_span = infotext.select_one("span.text-large")
+        if price_span:
+            result["Preis"] = price_span.get_text(strip=True)
+
+        # Objektnummer: <span class="lh-large">Objekt-Nr.: 4273</span>
+        objnr_span = infotext.select_one("span.lh-large")
+        if objnr_span:
+            text = objnr_span.get_text(strip=True)
+            m = re.search(r"Objekt[-\s]?Nr\.?:\s*(.+)", text)
+            if m:
+                result["Objektnummer"] = m.group(1).strip()
+
+        # Zimmer/Schlafzimmer/Bad: <li title="3 Zimmer">
+        for item in infotext.select("li.list-inline-item[title]"):
+            title = (item.get("title") or "").strip()
+            if "Zimmer" in title and "Schlaf" not in title and "Bad" not in title:
+                result["Zimmer"] = title
+            elif "Schlafzimmer" in title:
+                result["Schlafzimmer"] = title
+            elif "Badezimmer" in title:
+                result["Badezimmer"] = title
+
+    # --- Wohnfläche ---
+    for span in detail_page.select("span[title]"):
+        if _in_sidebar(span, sidebar_ids):
+            continue
+        title = span.get("title", "")
+        if "Wohnfl" in title and "m²" in title:
+            result["Wohnflaeche"] = span.get_text(strip=True)
+            break
+
+    # --- Beschreibung aus JSON-LD ---
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             data = json.loads(script.get_text(strip=True))
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             continue
-        nodes = data if isinstance(data, list) else [data]
-        for node in nodes:
+        graph = data.get("@graph", [data] if isinstance(data, dict) else data)
+        for node in (graph if isinstance(graph, list) else [graph]):
             if not isinstance(node, dict):
                 continue
-            offer = None
-            if node.get("@type") in ("Offer", "AggregateOffer"):
-                offer = node
-            elif "offers" in node:
-                offer = node["offers"]
-            if isinstance(offer, dict):
-                price = offer.get("price") or offer.get("lowPrice")
-                if price:
-                    try:
-                        val = float(str(price).replace(".", "").replace(",", "."))
-                        return f"{val:,.0f} €".replace(",", ".")
-                    except:
-                        pass
-            for k in ("price", "lowPrice", "highPrice"):
-                if k in node and node[k]:
-                    try:
-                        val = float(str(node[k]).replace(".", "").replace(",", "."))
-                        return f"{val:,.0f} €".replace(",", ".")
-                    except:
-                        continue
-    return ""
-
-def extract_price_dom(soup: BeautifulSoup) -> str:
-    for dt in soup.select("dt"):
-        label = (dt.get_text(" ", strip=True) or "").lower()
-        if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
-            dd = dt.find_next_sibling("dd")
-            if dd:
-                got = clean_price_string(dd.get_text(" ", strip=True))
-                if got:
-                    return got
-    for tr in soup.select("table tr"):
-        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
-        if len(cells) >= 2:
-            label = cells[0].lower()
-            if any(k in label for k in ("kaufpreis","kaltmiete","warmmiete","nettokaltmiete","miete","preis")):
-                got = clean_price_string(cells[1])
-                if got:
-                    return got
-    for li in soup.select("li"):
-        txt = li.get_text(" ", strip=True)
-        m = RE_PRICE_LINE.search(txt)
-        if m:
-            return clean_price_string(m.group(2) + " €")
-    return ""
-
-def extract_price_strict_top(page_text: str) -> str:
-    euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
-    euros_filtered = []
-    for e in euros:
-        mm = RE_EUR_NUMBER.search(e)
-        if not mm:
-            continue
-        try:
-            val = float(_normalize_numstring(mm.group(0)))
-            if val >= 10000:
-                euros_filtered.append(e)
-        except:
-            continue
-    if euros_filtered:
-        return clean_price_string(euros_filtered[0])
-    return ""
-
-def extract_price(soup: BeautifulSoup, page_text: str) -> str:
-    p = extract_price_from_jsonld(soup)
-    if p:
-        return p
-    p = extract_price_dom(soup)
-    if p:
-        return p
-    p = extract_price_strict_top(page_text)
-    if p:
-        return p
-    euros = [e.group(0) for e in RE_EUR_ANY.finditer(page_text)]
-    if euros:
-        def to_float(e):
-            mm = RE_EUR_NUMBER.search(e)
-            if not mm:
-                return 0.0
-            try:
-                return float(_normalize_numstring(mm.group(0)))
-            except:
-                return 0.0
-        best = max(euros, key=to_float)
-        return clean_price_string(best)
-    return ""
-
-# ===========================================================================
-# BESCHREIBUNG
-# ===========================================================================
-def _clean_desc_lines(lines):
-    out, seen = [], set()
-    for t in lines:
-        t = _norm(t)
-        if not t:
-            continue
-        if any(s.lower() in t.lower() for s in STOP_STRINGS):
-            continue
-        if RE_PHONE.search(t) or RE_EMAIL.search(t):
-            continue
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
-    return out
-
-def _find_expose_scope(soup: BeautifulSoup) -> Tag:
-    scope = soup.select_one(".sw-yframe .sw-vframe .v-expose")
-    if scope:
-        return scope
-    return soup.select_one(".v-expose") or soup
-
-def extract_description(soup: BeautifulSoup) -> str:
-    root = _find_expose_scope(soup)
-
-    candidates = []
-    tab0 = root.select_one(".v-tabs-items .v-window__container #tab-0")
-    if tab0:
-        candidates.append(tab0)
-    active = root.select_one(".v-tabs-items .v-window__container .v-window-item.v-window-item--active")
-    if active and active not in candidates:
-        candidates.append(active)
-
-    if not candidates:
-        for box in root.select(".v-card__text"):
-            head = box.select_one("p.h4, h4")
-            if head and _norm(head.get_text(" ", strip=True)).lower() == "beschreibung":
-                candidates.append(box)
-
-    for node in candidates:
-        box = node.select_one(".v-card .v-card__text") or node.select_one(".v-card__text") or node
-        lines = []
-        head = box.select_one("p.h4, h4")
-        for p in box.select("p"):
-            if p is head or ("h4" in (p.get("class") or [])):
-                continue
-            txt = _norm(p.get_text(" ", strip=True))
-            if txt:
-                lines.append(txt)
-        for li in box.select("ul li, ol li"):
-            t = _norm(li.get_text(" ", strip=True))
-            if t:
-                lines.append("• " + t)
-
-        lines = _clean_desc_lines(lines)
-        if lines:
-            return clean_text("\n".join(lines))[:6000]
-
-    return ""
-
-def _find_screenwork_links(soup: BeautifulSoup) -> list[str]:
-    urls = set()
-    for ifr in soup.select("iframe[src]"):
-        src = (ifr.get("src") or "").strip()
-        if any(host in src for host in ("screenwork", "immo")):
-            urls.add(src)
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        if any(host in href for host in ("screenwork", "immo")):
-            urls.add(href)
-    return list(urls)
-
-def get_description(detail_url: str, main_soup: BeautifulSoup) -> str:
-    desc = extract_description(main_soup)
-    if desc:
-        return desc
-
-    obj = ""
-    m = RE_OBJEKTNR.search(main_soup.get_text(" ", strip=True))
-    if m:
-        obj = m.group(1)
-
-    frames = FRAME_HTMLS.get(detail_url) or []
-    if frames:
-        for i, html in enumerate(frames):
-            try:
-                s = BeautifulSoup(html, "lxml")
-                desc = extract_description(s)
-                if desc:
-                    return desc
-            except Exception:
-                pass
-
-    try:
-        for sw_url in _find_screenwork_links(main_soup):
-            try:
-                if not sw_url.startswith("http"):
-                    sw_url = urljoin(detail_url, sw_url)
-                r = requests.get(sw_url, headers=HEADERS, timeout=30)
-                if r.ok and r.text:
-                    s2 = BeautifulSoup(r.text, "lxml")
-                    desc = extract_description(s2)
-                    if desc:
-                        return desc
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return ""
-
-# ===========================================================================
-# ZUSÄTZLICHE DATEN EXTRAKTION
-# ===========================================================================
-def extract_additional_data(page_text: str) -> dict:
-    data = {
-        "zimmer": "",
-        "wohnflaeche": "",
-        "grundstueck": "",
-        "baujahr": ""
-    }
-    
-    zimmer_patterns = [
-        r"(\d+)\s*Zimmer",
-        r"Zimmer[:\s]+(\d+)",
-        r"(\d+)-Zimmer",
-    ]
-    for pattern in zimmer_patterns:
-        m = re.search(pattern, page_text, re.IGNORECASE)
-        if m:
-            data["zimmer"] = m.group(1)
-            break
-    
-    wohnflaeche_patterns = [
-        r"(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*Wohnfläche",
-        r"Wohnfläche[:\s]+(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²",
-        r"(\d+(?:[.,]\d+)?)\s*m²\s*Wohnfl",
-    ]
-    for pattern in wohnflaeche_patterns:
-        m = re.search(pattern, page_text, re.IGNORECASE)
-        if m:
-            data["wohnflaeche"] = m.group(1).replace(",", ".")
-            break
-    
-    grundstueck_patterns = [
-        r"(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²\s*Grundstück",
-        r"Grundstück[:\s]+(?:ca\.\s*)?(\d+(?:[.,]\d+)?)\s*m²",
-        r"(\d+(?:[.,]\d+)?)\s*m²\s*(?:großes?\s+)?Grundstück",
-    ]
-    for pattern in grundstueck_patterns:
-        m = re.search(pattern, page_text, re.IGNORECASE)
-        if m:
-            data["grundstueck"] = m.group(1).replace(",", ".")
-            break
-    
-    baujahr_patterns = [
-        r"Baujahr[:\s]+(\d{4})",
-        r"aus\s+(?:dem\s+)?(?:Baujahr\s+)?(\d{4})",
-        r"(\d{4})\s+(?:erbaut|gebaut)",
-    ]
-    for pattern in baujahr_patterns:
-        m = re.search(pattern, page_text, re.IGNORECASE)
-        if m:
-            jahr = int(m.group(1))
-            if 1800 <= jahr <= 2030:
-                data["baujahr"] = str(jahr)
+            if node.get("@type") == "WebPage" and node.get("description"):
+                desc = node["description"].strip()
+                if desc.endswith("..."):
+                    desc = desc[:-3].strip()
+                result["Beschreibung"] = desc
                 break
-    
-    return data
+        if result["Beschreibung"]:
+            break
+
+    # --- Ansprechpartner ---
+    for strong in detail_page.select("strong"):
+        if _in_sidebar(strong, sidebar_ids):
+            continue
+        text = strong.get_text(strip=True)
+        if text.startswith("Herr ") or text.startswith("Frau "):
+            result["Ansprechpartner"] = text
+            break
+
+    # --- Bild-URL ---
+    head_img = detail_page.select_one(".immo-expose__head--image")
+    if head_img:
+        style = head_img.get("style", "")
+        m = re.search(r"url\(['\"]?(.*?)['\"]?\)", style)
+        if m:
+            result["Bild_URL"] = m.group(1)
+
+    if not result["Bild_URL"]:
+        for img in detail_page.select('img[src*="screenwork"]'):
+            if not _in_sidebar(img, sidebar_ids):
+                result["Bild_URL"] = img.get("src", "")
+                break
+
+    if not result["Bild_URL"]:
+        listing_img = detail_page.select_one(".immo-listing__image")
+        if listing_img and not _in_sidebar(listing_img, sidebar_ids):
+            style = listing_img.get("style", "")
+            m = re.search(r"url\(['\"]?(.*?)['\"]?\)", style)
+            if m:
+                result["Bild_URL"] = m.group(1)
+
+    return result
 
 # ===========================================================================
-# AIRTABLE FUNCTIONS
+# KURZBESCHREIBUNG MIT | TRENNZEICHEN
+# ===========================================================================
+def build_kurzbeschreibung(row: dict) -> str:
+    """
+    Baut eine kompakte Kurzbeschreibung mit | Trennzeichen.
+    Beispiel: Wohnung zum Kauf | 159.900 € | 4 Zimmer | 2 Schlafzimmer | 1 Badezimmer | 34613 Schwalmstadt
+    """
+    parts = []
+    if row.get("Typ"):
+        parts.append(row["Typ"])
+    if row.get("Preis"):
+        parts.append(row["Preis"])
+    if row.get("Zimmer"):
+        parts.append(row["Zimmer"])
+    if row.get("Schlafzimmer"):
+        parts.append(row["Schlafzimmer"])
+    if row.get("Badezimmer"):
+        parts.append(row["Badezimmer"])
+    if row.get("Wohnflaeche"):
+        parts.append(row["Wohnflaeche"])
+    if row.get("Standort"):
+        parts.append(row["Standort"])
+    if row.get("Objektnummer"):
+        parts.append(f"Obj.-Nr. {row['Objektnummer']}")
+    return " | ".join(parts)
+
+# ===========================================================================
+# RECORD BUILDER
+# ===========================================================================
+def make_record(row: dict) -> dict:
+    """Erstellt einen Airtable-kompatiblen Record aus den gescrapten Daten."""
+    preis_value = _parse_price_to_number(row["Preis"])
+    return {
+        "Titel":            row["Titel"],
+        "Kategorie":        row["Kategorie"],
+        "Webseite":         row["URL"],
+        "Objektnummer":     row["Objektnummer"],
+        "Beschreibung":     row["Beschreibung"],
+        "Kurzbeschreibung": build_kurzbeschreibung(row),
+        "Bild":             row["Bild_URL"],
+        "Preis":            preis_value,
+        "Standort":         row["Standort"],
+    }
+
+# ===========================================================================
+# AIRTABLE – HELFER
 # ===========================================================================
 def airtable_table_segment():
     if AIRTABLE_TABLE_ID:
@@ -527,8 +342,11 @@ def airtable_table_segment():
 def airtable_api_url():
     seg = airtable_table_segment()
     if not (AIRTABLE_BASE and seg):
-        raise RuntimeError(f"[Airtable] BASE oder TABLE fehlt.")
-    return f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{seg}"
+        raise RuntimeError(f"[Airtable] BASE oder TABLE/TABLE_ID fehlt. "
+                           f"BASE='{AIRTABLE_BASE}', TABLE_ID='{AIRTABLE_TABLE_ID}', TABLE='{AIRTABLE_TABLE}'")
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{seg}"
+    print(f"[Airtable] URL: {url}")
+    return url
 
 def airtable_headers():
     if not AIRTABLE_TOKEN:
@@ -542,11 +360,48 @@ def airtable_existing_fields():
         params["view"] = AIRTABLE_VIEW
     r = requests.get(url, headers=airtable_headers(), params=params, timeout=30)
     if not r.ok:
+        print(f"[Airtable] Schema-Check Warnung {r.status_code}: {r.text[:400]}")
         return set()
     data = r.json()
     if data.get("records"):
         return set(data["records"][0].get("fields", {}).keys())
     return set()
+
+def sanitize_record_for_airtable(record: dict, allowed_fields: set = None) -> dict:
+    out = dict(record)
+    if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
+        out.pop("Preis", None)
+    return out
+
+def airtable_batch_create(rows):
+    url = airtable_api_url()
+    for i in range(0, len(rows), 10):
+        payload = {"records": [{"fields": r} for r in rows[i:i+10]], "typecast": True}
+        r = requests.post(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
+        if not r.ok:
+            print(f"[Airtable] Create Fehler {r.status_code}: {r.text[:800]}")
+            r.raise_for_status()
+        time.sleep(0.25)
+
+def airtable_batch_update(pairs):
+    url = airtable_api_url()
+    for i in range(0, len(pairs), 10):
+        payload = {"records": pairs[i:i+10], "typecast": True}
+        r = requests.patch(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
+        if not r.ok:
+            print(f"[Airtable] Update Fehler {r.status_code}: {r.text[:800]}")
+            r.raise_for_status()
+        time.sleep(0.25)
+
+def airtable_batch_delete(ids):
+    url = airtable_api_url()
+    for i in range(0, len(ids), 10):
+        params = [("records[]", rid) for rid in ids[i:i+10]]
+        r = requests.delete(url, headers=airtable_headers(), params=params, timeout=60)
+        if not r.ok:
+            print(f"[Airtable] Delete Fehler {r.status_code}: {r.text[:800]}")
+            r.raise_for_status()
+        time.sleep(0.2)
 
 def airtable_list_all():
     ids, fields = [], []
@@ -557,7 +412,7 @@ def airtable_list_all():
     while True:
         r = requests.get(url, headers=airtable_headers(), params=params, timeout=60)
         if not r.ok:
-            raise RuntimeError(f"[Airtable] List Fehler {r.status_code}")
+            raise RuntimeError(f"[Airtable] List Fehler {r.status_code}: {r.text[:400]}")
         data = r.json()
         for rec in data.get("records", []):
             ids.append(rec["id"])
@@ -569,40 +424,6 @@ def airtable_list_all():
         time.sleep(0.2)
     return ids, fields
 
-def airtable_batch_create(rows):
-    url = airtable_api_url()
-    for i in range(0, len(rows), 10):
-        payload = {"records": [{"fields": r} for r in rows[i:i+10]], "typecast": True}
-        r = requests.post(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
-        r.raise_for_status()
-        time.sleep(0.25)
-
-def airtable_batch_update(pairs):
-    url = airtable_api_url()
-    for i in range(0, len(pairs), 10):
-        payload = {"records": pairs[i:i+10], "typecast": True}
-        r = requests.patch(url, headers=airtable_headers(), data=json.dumps(payload), timeout=60)
-        r.raise_for_status()
-        time.sleep(0.25)
-
-def airtable_batch_delete(ids):
-    url = airtable_api_url()
-    for i in range(0, len(ids), 10):
-        params = [("records[]", rid) for rid in ids[i:i+10]]
-        r = requests.delete(url, headers=airtable_headers(), params=params, timeout=60)
-        r.raise_for_status()
-        time.sleep(0.2)
-
-def sanitize_record_for_airtable(record: dict, allowed_fields: set = None) -> dict:
-    ALWAYS_ALLOWED = {"Kurzbeschreibung"}
-    out = dict(record)
-    if "Preis" in out and (out["Preis"] is None or out["Preis"] == ""):
-        out.pop("Preis", None)
-    if allowed_fields:
-        all_allowed = allowed_fields | ALWAYS_ALLOWED
-        out = {k: v for k, v in out.items() if k in all_allowed}
-    return out
-
 def unique_key(fields: dict) -> str:
     obj = (fields.get("Objektnummer") or "").strip()
     if obj:
@@ -613,488 +434,11 @@ def unique_key(fields: dict) -> str:
     return f"hash:{hash(json.dumps(fields, sort_keys=True))}"
 
 # ===========================================================================
-# VALIDIERUNG
-# ===========================================================================
-def is_valid_record(record: dict) -> bool:
-    titel = (record.get("Titel") or "").strip()
-    webseite = (record.get("Webseite") or "").strip()
-    
-    if not titel or not webseite:
-        return False
-    
-    filled_fields = 0
-    for key, value in record.items():
-        if value is not None:
-            if isinstance(value, str) and value.strip():
-                filled_fields += 1
-            elif isinstance(value, (int, float)) and value > 0:
-                filled_fields += 1
-    
-    return filled_fields >= 3
-
-def filter_valid_records(records: list) -> list:
-    valid = []
-    invalid_count = 0
-    
-    for record in records:
-        if is_valid_record(record):
-            valid.append(record)
-        else:
-            invalid_count += 1
-            print(f"[FILTER] Ungültiger Record: {record.get('Titel', 'KEIN TITEL')[:50]}")
-    
-    if invalid_count > 0:
-        print(f"[FILTER] {invalid_count} ungültige Records herausgefiltert")
-    
-    return valid
-
-def cleanup_empty_airtable_records(kategorie: str):
-    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
-        return
-    
-    print(f"[CLEANUP] Prüfe Airtable auf leere Records ({kategorie})...")
-    
-    try:
-        all_ids, all_fields = airtable_list_all()
-        
-        to_delete = []
-        for rec_id, fields in zip(all_ids, all_fields):
-            if fields.get("Kategorie") == kategorie and not is_valid_record(fields):
-                to_delete.append(rec_id)
-        
-        if to_delete:
-            print(f"[CLEANUP] Lösche {len(to_delete)} leere Records...")
-            airtable_batch_delete(to_delete)
-            print(f"[CLEANUP] ✅ {len(to_delete)} leere Records gelöscht")
-        else:
-            print("[CLEANUP] ✅ Keine leeren Records gefunden")
-            
-    except Exception as e:
-        print(f"[CLEANUP] Fehler: {e}")
-
-# ===========================================================================
-# CACHES - Kurzbeschreibung UND Unterkategorie
-# ===========================================================================
-KURZBESCHREIBUNG_CACHE = {}
-UNTERKATEGORIE_CACHE = {}
-
-def load_caches():
-    global KURZBESCHREIBUNG_CACHE, UNTERKATEGORIE_CACHE
-    
-    if not (AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment()):
-        print("[CACHE] Airtable nicht konfiguriert - Caches leer")
-        return
-    
-    try:
-        all_ids, all_fields = airtable_list_all()
-        for fields in all_fields:
-            obj_nr = fields.get("Objektnummer", "").strip()
-            if not obj_nr:
-                continue
-            
-            kurzbeschreibung = fields.get("Kurzbeschreibung", "").strip()
-            if kurzbeschreibung:
-                KURZBESCHREIBUNG_CACHE[obj_nr] = kurzbeschreibung
-            
-            unterkategorie = fields.get("Unterkategorie", "").strip()
-            if unterkategorie:
-                UNTERKATEGORIE_CACHE[obj_nr] = unterkategorie
-        
-        print(f"[CACHE] {len(KURZBESCHREIBUNG_CACHE)} Kurzbeschreibungen geladen")
-        print(f"[CACHE] {len(UNTERKATEGORIE_CACHE)} Unterkategorien geladen")
-    except Exception as e:
-        print(f"[CACHE] Fehler beim Laden: {e}")
-
-def get_cached_kurzbeschreibung(objektnummer: str) -> str:
-    return KURZBESCHREIBUNG_CACHE.get(objektnummer, "")
-
-def get_cached_unterkategorie(objektnummer: str) -> str:
-    return UNTERKATEGORIE_CACHE.get(objektnummer, "")
-
-# ===========================================================================
-# GPT KURZBESCHREIBUNG - NEUE VERSION
-# ===========================================================================
-KURZBESCHREIBUNG_FIELDS = [
-    "Objekttyp",
-    "Baujahr",
-    "Wohnfläche",
-    "Grundstück",
-    "Zimmer",
-    "Preis",
-    "Standort",
-    "Energieeffizienz",
-    "Besonderheiten"
-]
-
-def normalize_kurzbeschreibung(gpt_output: str, scraped_data: dict) -> str:
-    """Normalisiert GPT-Ausgabe. KEINE Platzhalter, nur vorhandene Felder."""
-    parsed = {}
-    for line in gpt_output.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        if ":" in line:
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if value and value not in ["-", "—", "k. A.", "unbekannt", "nicht angegeben", ""]:
-                parsed[key] = value
-    
-    scrape_mapping = {
-        "Zimmer": "zimmer",
-        "Wohnfläche": "wohnflaeche", 
-        "Grundstück": "grundstueck",
-        "Baujahr": "baujahr",
-        "Preis": "preis",
-        "Standort": "standort",
-    }
-    
-    for field, scrape_key in scrape_mapping.items():
-        if field not in parsed or not parsed[field]:
-            scrape_value = scraped_data.get(scrape_key, "")
-            if scrape_value and str(scrape_value).strip():
-                if field == "Preis":
-                    try:
-                        preis_num = float(str(scrape_value).replace(".", "").replace(",", ".").replace("€", "").strip())
-                        parsed[field] = f"{int(preis_num)} €"
-                    except:
-                        pass
-                elif field == "Wohnfläche":
-                    val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
-                    if val:
-                        parsed[field] = f"{val} m²"
-                elif field == "Grundstück":
-                    val = str(scrape_value).replace("ca.", "").replace("m²", "").strip()
-                    if val:
-                        parsed[field] = f"{val} m²"
-                else:
-                    parsed[field] = str(scrape_value)
-    
-    output_lines = []
-    for field in KURZBESCHREIBUNG_FIELDS:
-        value = parsed.get(field, "")
-        if value and value.strip():
-            output_lines.append(f"{field}: {value}")
-    
-    return "\n".join(output_lines)
-
-def generate_kurzbeschreibung(beschreibung: str, titel: str, kategorie: str, preis: str, ort: str,
-                               zimmer: str = "", wohnflaeche: str = "", grundstueck: str = "", baujahr: str = "",
-                               objektnummer: str = "") -> str:
-    """Generiert strukturierte Kurzbeschreibung mit GPT. NEUE VERSION mit strengem Prompt."""
-    
-    if objektnummer:
-        cached = get_cached_kurzbeschreibung(objektnummer)
-        if cached:
-            print(f"[CACHE] Kurzbeschreibung aus Cache für {objektnummer[:20]}...")
-            return cached
-    
-    scraped_data = {
-        "kategorie": kategorie,
-        "preis": preis,
-        "standort": ort,
-        "zimmer": zimmer,
-        "wohnflaeche": wohnflaeche,
-        "grundstueck": grundstueck,
-        "baujahr": baujahr,
-    }
-    
-    if not OPENAI_API_KEY:
-        return normalize_kurzbeschreibung("", scraped_data)
-    
-    # NEUER STRENGER PROMPT
-    prompt = f"""# Rolle
-Du bist ein präziser Immobilien-Datenanalyst und Parser. Deine Aufgabe ist es, aus unstrukturierten Immobilienanzeigen ausschließlich objektive, explizit genannte Fakten zu extrahieren und streng strukturiert auszugeben. Du arbeitest regelbasiert, deterministisch und formatgenau. Kreative Ergänzungen sind untersagt.
-
-# Aufgabe
-1. Analysiere die bereitgestellte Immobilienanzeige vollständig.
-2. Extrahiere nur eindeutig genannte, objektive Fakten.
-3. Gib die strukturierte Kurzbeschreibung exakt im vorgegebenen Zeilenformat aus.
-4. Lasse jedes Feld vollständig weg, zu dem keine eindeutige Angabe vorliegt.
-
-# Eingabedaten
-TITEL: {titel}
-KATEGORIE: {kategorie}
-PREIS: {preis if preis else 'nicht angegeben'}
-STANDORT: {ort if ort else 'nicht angegeben'}
-BESCHREIBUNG: {beschreibung[:3000]}
-
-# Erlaubte Felder (Whitelist – verbindlich)
-Es dürfen ausschließlich die folgenden Felder verwendet werden. Jedes andere Feld ist strikt verboten.
-
-Objekttyp
-Baujahr
-Wohnfläche
-Grundstück
-Zimmer
-Preis
-Standort
-Energieeffizienz
-Besonderheiten
-
-# Ausgabeformat (verbindlich)
-Die Ausgabe muss exakt diesem Muster folgen. Jede Eigenschaft steht in einer eigenen Zeile. Keine Leerzeilen, keine zusätzlichen Texte, keine Markdown-Formatierung.
-
-Objekttyp: [Einfamilienhaus | Mehrfamilienhaus | Eigentumswohnung | Baugrundstück | Reihenhaus | Doppelhaushälfte | Sonstiges]
-Baujahr: [Jahr]
-Wohnfläche: [Zahl in m²]
-Grundstück: [Zahl in m²]
-Zimmer: [Anzahl]
-Preis: [Zahl in €]
-Standort: [Ort oder PLZ Ort]
-Energieeffizienz: [Klasse]
-Besonderheiten: [kommaseparierte Liste]
-
-# Strikte Regeln (bindend)
-• Es ist strengstens untersagt, eigene Felder zu erfinden.
-• Felder wie „Schlafzimmer", „Kategorie", „Etage", „Ausstattung", „Kauf/Miete" oder ähnliche sind ausnahmslos verboten.
-• Es dürfen keine Platzhalter verwendet werden (z. B. „-", „—", „k. A.", „unbekannt").
-• Wenn ein Feld nicht eindeutig ermittelbar ist, darf die gesamte Zeile nicht ausgegeben werden.
-• Die Reihenfolge der Zeilen muss exakt der Vorgabe entsprechen.
-• Es darf niemals mehr als ein Feld pro Zeile stehen.
-• Verwende ausschließlich arabische Ziffern.
-• Einheiten exakt wie folgt anhängen:
-  – Wohnfläche und Grundstück: m²
-  – Preis: €
-• Keine Interpretationen, keine Schätzungen, keine Ableitungen.
-• Im Zweifel gilt: lieber weniger Felder ausgeben, niemals mehr.
-• KEINE LEERZEILEN in der Ausgabe!
-
-# Ziel
-Die Ausgabe wird automatisiert weiterverarbeitet (z. B. Airtable, Voiceflow, Such- und Filterlogiken). Jede Abweichung vom Format gilt als Fehler."""
-
-    try:
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": "Du bist ein regelbasierter Datenparser. Halte dich strikt an die Vorgaben. Keine Kreativität, keine Ergänzungen. Keine Leerzeilen."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 400,
-            "temperature": 0.0
-        }
-        
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        gpt_output = result["choices"][0]["message"]["content"].strip()
-        
-        kurzbeschreibung = normalize_kurzbeschreibung(gpt_output, scraped_data)
-        
-        print(f"[GPT] Kurzbeschreibung generiert ({len(kurzbeschreibung)} Zeichen)")
-        return kurzbeschreibung
-        
-    except Exception as e:
-        print(f"[ERROR] GPT Kurzbeschreibung fehlgeschlagen: {e}")
-        return normalize_kurzbeschreibung("", scraped_data)
-
-# ===========================================================================
-# GPT UNTERKATEGORIE-KLASSIFIKATION MIT CACHING
-# ===========================================================================
-KEYS_WOHNUNG = ["wohnung", "etagenwohnung", "eigentumswohnung", "apartment", "etw", "penthouse"]
-KEYS_HAUS = ["haus", "einfamilienhaus", "zweifamilienhaus", "reihenhaus", "doppelhaushälfte", "villa", "bungalow", "efh", "dhh", "mfh"]
-KEYS_GEWERBE = ["gewerbe", "büro", "laden", "praxis", "lager", "halle", "gastronomie", "gewerbefläche"]
-KEYS_GRUNDSTUECK = ["grundstück", "baugrundstück", "bauland", "bauplatz"]
-
-def heuristic_subcategory(titel: str, beschreibung: str) -> str:
-    text = (titel + " " + beschreibung).lower()
-    
-    scores = {
-        "Grundstück": sum(1 for k in KEYS_GRUNDSTUECK if k in text),
-        "Gewerbe": sum(1 for k in KEYS_GEWERBE if k in text),
-        "Wohnung": sum(1 for k in KEYS_WOHNUNG if k in text),
-        "Haus": sum(1 for k in KEYS_HAUS if k in text),
-    }
-    
-    if scores["Grundstück"] >= 1:
-        return "Grundstück"
-    if scores["Gewerbe"] >= 2:
-        return "Gewerbe"
-    
-    best = max(scores, key=scores.get)
-    if scores[best] >= 1:
-        return best
-    
-    return "Haus"
-
-def gpt_classify_unterkategorie(titel: str, beschreibung: str, objektnummer: str) -> str:
-    """Klassifiziert die Unterkategorie via GPT. MIT CACHING."""
-    
-    if objektnummer:
-        cached = get_cached_unterkategorie(objektnummer)
-        if cached:
-            print(f"[CACHE] Unterkategorie aus Cache: {cached}")
-            return cached
-    
-    if not OPENAI_API_KEY:
-        return heuristic_subcategory(titel, beschreibung)
-    
-    allowed_cats = "Wohnung, Haus, Gewerbe, Grundstück"
-    
-    prompt = f"""Klassifiziere dieses Immobilien-Exposé in EXAKT eine der folgenden Kategorien:
-{allowed_cats}
-
-WICHTIG:
-- Gib NUR das eine Wort aus (z.B. "Wohnung" oder "Gewerbe")
-- Keine Erklärung, kein Punkt, nur das Wort
-- Bei Büro, Laden, Praxis, Lager, Halle → "Gewerbe"
-- Bei Baugrundstück, Bauland, Bauplatz → "Grundstück"
-- Bei Eigentumswohnung, ETW, Apartment → "Wohnung"
-- Bei Einfamilienhaus, DHH, Reihenhaus, Villa → "Haus"
-
-Titel: {titel}
-Beschreibung: {beschreibung[:1500]}"""
-
-    try:
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": "Du bist ein präziser Immobilien-Klassifizierer. Antworte mit genau einem Wort."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 10,
-            "temperature": 0.0
-        }
-        
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        output = result["choices"][0]["message"]["content"].strip().replace(".", "")
-        
-        valid = {"Wohnung", "Haus", "Gewerbe", "Grundstück"}
-        
-        if output in valid:
-            print(f"[GPT] Unterkategorie: {output}")
-            return output
-        else:
-            print(f"[GPT] Ungültige Kategorie '{output}', verwende Heuristik")
-            return heuristic_subcategory(titel, beschreibung)
-        
-    except Exception as e:
-        print(f"[ERROR] GPT Klassifikation fehlgeschlagen: {e}")
-        return heuristic_subcategory(titel, beschreibung)
-
-# ===========================================================================
-# DETAIL-PARSER
-# ===========================================================================
-def parse_detail(detail_url: str, mode: str):
-    soup = soup_get(detail_url)
-    page_text = soup.get_text("\n", strip=True)
-
-    h1 = soup.select_one("h1")
-    title = h1.get_text(strip=True) if h1 else ""
-
-    description = get_description(detail_url, soup)
-
-    m_obj = RE_OBJEKTNR.search(page_text)
-    objektnummer = m_obj.group(1).strip() if m_obj else ""
-
-    preis_value = extract_price(soup, page_text)
-
-    m_plz = RE_PLZ_ORT_STRICT.search(page_text)
-    ort = ""
-    if m_plz:
-        plz, name = m_plz.group(1), m_plz.group(2)
-        name = re.split(r"[|,•·\-\–—/()]", name)[0].strip()
-        name = re.sub(r"\s{2,}", " ", name)
-        ort = f"{plz} {name}"
-
-    image_url = ""
-    a_img = soup.select_one('a[href*="immo."]') or soup.select_one('a[href*="screenwork"]')
-    if a_img and a_img.has_attr("href"):
-        image_url = a_img["href"]
-    else:
-        img = soup.find("img")
-        if img and img.has_attr("src"):
-            image_url = urljoin(BASE, img["src"])
-
-    page_text_low = page_text.lower()
-    kategorie_detected = "Mieten" if RE_MIETE.search(page_text_low) else "Kaufen"
-    
-    additional_data = extract_additional_data(page_text)
-
-    return {
-        "Titel":        title,
-        "URL":          detail_url,
-        "Description":  description,
-        "Objektnummer": objektnummer,
-        "Preis":        preis_value,
-        "Ort":          ort,
-        "Bild_URL":     image_url,
-        "KategorieDetected": kategorie_detected,
-        "AdditionalData": additional_data,
-    }
-
-# ===========================================================================
-# RECORD BUILDER
-# ===========================================================================
-def make_record(row):
-    preis_value = parse_price_to_number(row["Preis"])
-    kategorie = row["KategorieDetected"]
-    additional = row.get("AdditionalData", {})
-    
-    # Unterkategorie via GPT (mit Cache)
-    unterkategorie = gpt_classify_unterkategorie(
-        titel=row["Titel"],
-        beschreibung=row["Description"],
-        objektnummer=row["Objektnummer"]
-    )
-    
-    # Kurzbeschreibung via GPT (mit Cache)
-    kurzbeschreibung = generate_kurzbeschreibung(
-        beschreibung=row["Description"],
-        titel=row["Titel"],
-        kategorie=kategorie,
-        preis=row["Preis"],
-        ort=row["Ort"],
-        zimmer=additional.get("zimmer", ""),
-        wohnflaeche=additional.get("wohnflaeche", ""),
-        grundstueck=additional.get("grundstueck", ""),
-        baujahr=additional.get("baujahr", ""),
-        objektnummer=row["Objektnummer"]
-    )
-    
-    return {
-        "Titel":           row["Titel"],
-        "Kategorie":       kategorie,
-        "Unterkategorie":  unterkategorie,
-        "Webseite":        row["URL"],
-        "Objektnummer":    row["Objektnummer"],
-        "Beschreibung":    clean_text(row["Description"]),
-        "Kurzbeschreibung": kurzbeschreibung,
-        "Bild":            row["Bild_URL"],
-        "Preis":           preis_value,
-        "Standort":        row["Ort"],
-    }
-
-# ===========================================================================
-# SYNC
+# SYNC je Kategorie
 # ===========================================================================
 def sync_category(scraped_rows, category_label: str):
     allowed = airtable_existing_fields()
-    print(f"[Airtable] Erkannte Felder: {sorted(list(allowed)) or '(keine)'}")
+    print(f"[Airtable] Erkannte Beispiel-Felder: {sorted(list(allowed)) or '(keine)'}")
 
     all_ids, all_fields = airtable_list_all()
     existing = {}
@@ -1121,8 +465,7 @@ def sync_category(scraped_rows, category_label: str):
 
     to_delete_ids = [rec_id for k, (rec_id, _) in existing.items() if k not in keep]
 
-    print(f"\n[SYNC] {category_label} → create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
-    
+    print(f"[SYNC] {category_label} -> create: {len(to_create)}, update: {len(to_update)}, delete: {len(to_delete_ids)}")
     if to_create:
         airtable_batch_create(to_create)
     if to_update:
@@ -1134,99 +477,148 @@ def sync_category(scraped_rows, category_label: str):
 # MAIN
 # ===========================================================================
 def run(mode="auto"):
+    """
+    Modi:
+      - 'kauf'  : nur Kaufen
+      - 'miete' : nur Mieten
+      - 'auto'  : beide Kategorien (Kauf + Miete)
+    """
     assert mode in ("kauf", "miete", "auto"), "Mode muss 'kauf', 'miete' oder 'auto' sein."
     csv_kauf  = "msi_kauf.csv"
     csv_miete = "msi_miete.csv"
 
-    # Lade Caches
-    print("[INIT] Lade Caches aus Airtable...")
-    load_caches()
-
     all_rows, seen = [], set()
-    for idx, list_url in enumerate(get_list_page_urls("kauf"), 1):
-        try:
-            detail_links = collect_detail_links(list_url)
-        except Exception as e:
-            print(f"[WARN] Abbruch beim Lesen der Liste: {list_url} -> {e}")
-            break
 
-        if not detail_links:
-            print(f"[INFO] Keine Einträge auf Seite {idx} – Stop.")
-            break
-
-        new_links = [u for u in detail_links if u not in seen]
-        seen.update(new_links)
-        if not new_links:
-            print(f"[INFO] Seite {idx}: keine neuen Links – weiter.")
-            continue
-
-        print(f"[{mode.upper()}] Seite {idx}: {len(new_links)} Exposés")
-
-        for j, url in enumerate(new_links, 1):
+    # --- Kauf-Listings crawlen ---
+    if mode in ("kauf", "auto"):
+        print(f"\n{'=' * 60}")
+        print(f"  KAUFEN – Listings sammeln")
+        print(f"{'=' * 60}")
+        for idx in range(1, 51):
+            if idx == 1:
+                list_url = f"{BASE}/kaufen/immobilienangebote/?mt=buy&sort=sort%7Cdesc"
+            else:
+                list_url = f"{BASE}/kaufen/immobilienangebote/page/{idx}/?mt=buy&sort=sort%7Cdesc"
             try:
-                row = parse_detail(url, mode)
-
-                if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
-                    print(f"  - {j}/{len(new_links)} SKIPPED (verkauft)")
-                    continue
-
-                record = make_record(row)
-                all_rows.append(record)
-                print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record.get('Unterkategorie', 'N/A'):12} | {record['Titel'][:50]}")
-                time.sleep(0.1)
+                detail_links = collect_detail_links(list_url)
             except Exception as e:
-                print(f"    [FEHLER] {url} -> {e}")
-                continue
-        time.sleep(0.2)
+                print(f"[WARN] Abbruch Seite {idx}: {e}")
+                break
+            new_links = [u for u in detail_links if u not in seen]
+            if idx > 1 and not new_links:
+                print(f"[INFO] Keine neuen Links auf Seite {idx} – Stop.")
+                break
+            seen.update(new_links)
+            print(f"[Seite {idx}] {len(new_links)} neue Detailseiten")
+            for j, url in enumerate(new_links, 1):
+                try:
+                    row = parse_detail(url)
+                    if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
+                        print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
+                        continue
+                    record = make_record(row)
+                    all_rows.append(record)
+                    print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:50]} | {record.get('Standort','')}")
+                    time.sleep(0.15)
+                except Exception as e:
+                    print(f"    [FEHLER] {url} -> {e}")
+                    continue
+            time.sleep(0.25)
+
+    # --- Miet-Listings crawlen ---
+    if mode in ("miete", "auto"):
+        print(f"\n{'=' * 60}")
+        print(f"  MIETEN – Listings sammeln")
+        print(f"{'=' * 60}")
+        for idx in range(1, 51):
+            if idx == 1:
+                list_url = f"{BASE}/kaufen/immobilienangebote/?mt=rent&sort=sort%7Cdesc"
+            else:
+                list_url = f"{BASE}/kaufen/immobilienangebote/page/{idx}/?mt=rent&sort=sort%7Cdesc"
+            try:
+                detail_links = collect_detail_links(list_url)
+            except Exception as e:
+                print(f"[WARN] Abbruch Seite {idx}: {e}")
+                break
+            new_links = [u for u in detail_links if u not in seen]
+            if idx > 1 and not new_links:
+                print(f"[INFO] Keine neuen Links auf Seite {idx} – Stop.")
+                break
+            seen.update(new_links)
+            print(f"[Seite {idx}] {len(new_links)} neue Detailseiten")
+            for j, url in enumerate(new_links, 1):
+                try:
+                    row = parse_detail(url)
+                    if re.search(r"\bverkauft\b", row.get("Titel", ""), re.IGNORECASE):
+                        print(f"  - {j}/{len(new_links)} SKIPPED (verkauft) | {row.get('Titel','')[:70]}")
+                        continue
+                    record = make_record(row)
+                    all_rows.append(record)
+                    print(f"  - {j}/{len(new_links)} {record['Kategorie']:6} | {record['Titel'][:50]} | {record.get('Standort','')}")
+                    time.sleep(0.15)
+                except Exception as e:
+                    print(f"    [FEHLER] {url} -> {e}")
+                    continue
+            time.sleep(0.25)
 
     if not all_rows:
-        print("[WARN] Keine Datensätze gefunden.")
-        return
-
-    # VALIDIERUNG
-    print(f"\n[VALIDATE] Prüfe {len(all_rows)} Records...")
-    all_rows = filter_valid_records(all_rows)
-
-    if not all_rows:
-        print("[WARN] Keine gültigen Datensätze nach Filterung.")
+        print("[WARN] Keine Datensaetze gefunden.")
         return
 
     rows_kauf  = [r for r in all_rows if r["Kategorie"] == "Kaufen"]
     rows_miete = [r for r in all_rows if r["Kategorie"] == "Mieten"]
 
-    if mode == "kauf":
-        rows_miete = []
-    if mode == "miete":
-        rows_kauf = []
-
-    cols = ["Titel","Kategorie","Unterkategorie","Webseite","Objektnummer","Beschreibung","Kurzbeschreibung","Bild","Preis","Standort"]
-    
+    # --- CSV Export ---
+    cols = ["Titel", "Kategorie", "Webseite", "Objektnummer", "Beschreibung",
+            "Kurzbeschreibung", "Bild", "Preis", "Standort"]
     if rows_kauf:
         with open(csv_kauf, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+            w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             w.writerows(rows_kauf)
         print(f"[CSV] {csv_kauf}: {len(rows_kauf)} Zeilen")
-    
     if rows_miete:
         with open(csv_miete, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+            w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             w.writerows(rows_miete)
         print(f"[CSV] {csv_miete}: {len(rows_miete)} Zeilen")
 
+    # --- Zusammenfassung ---
+    total = len(all_rows)
+    print(f"\n{'=' * 60}")
+    print(f"  ZUSAMMENFASSUNG: {total} Immobilien ({len(rows_kauf)} Kauf, {len(rows_miete)} Miete)")
+    print(f"{'=' * 60}")
+    checks = {
+        "Titel": sum(1 for r in all_rows if r.get("Titel")),
+        "Standort": sum(1 for r in all_rows if r.get("Standort")),
+        "Preis": sum(1 for r in all_rows if r.get("Preis")),
+        "Objektnummer": sum(1 for r in all_rows if r.get("Objektnummer")),
+        "Beschreibung": sum(1 for r in all_rows if r.get("Beschreibung")),
+        "Kurzbeschreibung": sum(1 for r in all_rows if r.get("Kurzbeschreibung")),
+        "Bild": sum(1 for r in all_rows if r.get("Bild")),
+    }
+    for field, count in checks.items():
+        pct = count / total * 100 if total else 0
+        print(f"  {field:20s}: {count}/{total} ({pct:.0f}%)")
+
+    # --- Beispiel Kurzbeschreibung ---
+    print(f"\n  Beispiel Kurzbeschreibung:")
+    for r in all_rows[:3]:
+        print(f"    {r.get('Kurzbeschreibung', '')}")
+
+    # --- Airtable Sync ---
     if AIRTABLE_TOKEN and AIRTABLE_BASE and airtable_table_segment():
+        print(f"\n[Airtable] Starte Sync...")
         if rows_kauf:
             sync_category(rows_kauf, "Kaufen")
-            cleanup_empty_airtable_records("Kaufen")
         if rows_miete:
             sync_category(rows_miete, "Mieten")
-            cleanup_empty_airtable_records("Mieten")
-        print("[Airtable] Synchronisation abgeschlossen.\n")
+        print("[Airtable] Sync abgeschlossen.")
     else:
-        print("[Airtable] ENV nicht gesetzt – Upload übersprungen.")
+        print("\n[Airtable] ENV nicht gesetzt – Upload uebersprungen.")
 
 # ===========================================================================
 if __name__ == "__main__":
-    mode = (sys.argv[1].strip().lower() if len(sys.argv) > 1 else "kauf")
+    mode = (sys.argv[1].strip().lower() if len(sys.argv) > 1 else "auto")
     run(mode)
